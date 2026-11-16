@@ -6,7 +6,8 @@ directories:
   output: dist/release
   buildResources: build
 
-# Only runtime files are shipped; the source tree is packed as is (no asar)
+# asar is disabled on purpose: the emulator/agent code resolves real filesystem paths and
+# spawns binaries from the unpacked tree.
 asar: false
 files:
   - src/**/*
@@ -21,16 +22,15 @@ files:
   - "!node_modules/@napi-rs/lzma/*.ts"
   - "!node_modules/@napi-rs/lzma/browser-entry.*"
 
-# только нужные локали Electron (41MB → ~3MB)
+# Only the Electron locales we actually need (41 MB -> ~1 MB); UI and docs are English.
 electronLanguages:
-  - zh-CN
-  - zh-TW
   - en-US
 
 # Full runtime (emulator + platform-tools + system images), built by build/prepare-runtime.js.
-# Once bundled, the first launch needs no downloads.
+# Once bundled, the first launch needs no downloads. Only included when the tree exists, so
+# a plain `electron-builder` run (CI packages the download-on-demand flavour) stays quiet.
 extraResources:
-  - from: build/runtime
+  - from: ${env.APKSTART_RUNTIME_DIR:-build/runtime}
     to: runtime
     filter:
       - "**/*"
@@ -49,6 +49,8 @@ linux:
     through Android Emulator (KVM) and gets a desktop entry.
   icon: src/ui/assets/logo-128.png
   executableName: apkstart
+  desktopName: apkstart
+  syncDesktopName: true
   maintainer: ApkStart Linux fork <noreply@example.invalid>
   vendor: ApkStart
   desktop:
@@ -74,5 +76,5 @@ deb:
   priority: optional
   packageCategory: utils
 
-# Сжатие: образ Android уже сжат, здесь только Electron.
+# Compression: the Android image is already compressed, so only Electron benefits here.
 compression: normal

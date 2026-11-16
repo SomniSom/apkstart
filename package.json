@@ -4,6 +4,7 @@
   "version": "0.4.4",
   "description": "Лёгкий запуск Android-приложений на Linux: двойной клик по APK → установка → отдельное окно приложения (Android Emulator + KVM)",
   "main": "src/main.js",
+  "desktopName": "apkstart",
   "author": "RoutineMiku (upstream); Linux fork maintained in this repository",
   "license": "MIT",
   "private": true,
