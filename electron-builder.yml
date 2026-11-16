@@ -72,7 +72,7 @@ deb:
   recommends:
     - qemu-kvm
   priority: optional
-  section: utils
+  packageCategory: utils
 
 # Сжатие: образ Android уже сжат, здесь только Electron.
 compression: normal
