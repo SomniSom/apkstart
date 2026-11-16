@@ -401,13 +401,17 @@ function assert(cond, msg) { if (!cond) throw new Error(msg || 'assertion failed
     assert(info.ok && info.api === '34' && info.tag === 'google_apis_playstore', `the API 34 image should be ready: ${JSON.stringify(info)}`);
   });
 
-  await test('full-build branding assets are present', async () => {
+  await test('branding assets referenced by the UI exist', async () => {
     const root = path.join(__dirname, '..');
-    assert(fs.existsSync(path.join(root, 'src', 'ui', 'assets', 'douyin-qr.jpg')), 'the Douyin QR image is missing');
     assert(fs.existsSync(path.join(root, 'build', 'fetch-runtime.js')), 'the runtime packaging script is missing');
     const html = fs.readFileSync(path.join(root, 'src', 'ui', 'index.html'), 'utf8');
-    assert(html.includes('douyin-qr.jpg'), 'the About section does not reference the QR image');
-    assert(html.includes('https://v.douyin.com/9TIIxVCANig/'), 'the Douyin profile link is missing');
+    // Every local asset the About section references must be on disk
+    const refs = [...html.matchAll(/src="(assets\/[^"]+)"/g)].map((m) => m[1]);
+    assert(refs.length > 0, 'the About section references no assets');
+    for (const rel of refs) {
+      assert(fs.existsSync(path.join(root, 'src', 'ui', rel)), `missing asset: ${rel}`);
+    }
+    assert(html.includes('https://github.com/RoutineMiku/apkstart'), 'upstream credit is missing');
   });
 
   console.log(results.join('\n'));

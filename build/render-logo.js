@@ -9,7 +9,6 @@
 const { app, BrowserWindow } = require('electron');
 const fs = require('fs');
 const path = require('path');
-const { pngToIco } = require('../src/core/shortcut');
 
 const ROOT = path.join(__dirname, '..');
 const SIZE = 1024;
@@ -47,10 +46,6 @@ app.whenReady().then(async () => {
   save(1024, path.join(ROOT, 'docs', 'images', 'logo.png'));
   save(512, path.join(ROOT, 'src', 'ui', 'assets', 'logo.png'));
   save(128, path.join(ROOT, 'src', 'ui', 'assets', 'logo-128.png'));
-
-  const ico = pngToIco(full);
-  fs.writeFileSync(path.join(ROOT, 'src', 'ui', 'assets', 'appicon.ico'), ico);
-  console.log(' -> src/ui/assets/appicon.ico', Math.round(ico.length / 1024) + 'KB');
 
   app.exit(0);
 });
