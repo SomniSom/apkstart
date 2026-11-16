@@ -49,7 +49,8 @@ linux:
     through Android Emulator (KVM) and gets a desktop entry.
   icon: src/ui/assets/logo-128.png
   executableName: apkstart
-  desktopName: apkstart
+  # The .desktop name comes from package.json's "desktopName" field in electron-builder 26;
+  # there is no linux.desktopName key, only the sync switch.
   syncDesktopName: true
   maintainer: ApkStart Linux fork <noreply@example.invalid>
   vendor: ApkStart
