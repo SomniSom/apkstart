@@ -36,7 +36,7 @@
   "scripts": {
     "start": "electron .",
     "dev": "electron . --dev",
-    "test": "node test/run-tests.js && node test/engine-test.js && node test/auto-test.js",
+    "test": "node test/run-tests.js && node test/core-test.js && node test/ui-wiring-test.js && node test/engine-test.js && node test/auto-test.js",
     "pack": "node build/pack.js",
     "build:deb": "node build/prepare-runtime.js && electron-builder --linux deb",
     "build:appimage": "node build/prepare-runtime.js && electron-builder --linux AppImage",
@@ -45,13 +45,17 @@
     "selftest": "node scripts/selftest.js",
     "assoc:on": "node scripts/assoc.js on",
     "assoc:off": "node scripts/assoc.js off",
-    "check:deps": "node tools/check-linux.js"
+    "check:deps": "node tools/check-linux.js",
+    "test:coverage": "node test/coverage.js"
   },
   "devDependencies": {
-    "electron": "^33.4.11",
+    "electron": "^45.3.3",
     "electron-builder": "^26.18.0"
   },
   "dependencies": {
     "@napi-rs/lzma": "^1.5.3"
+  },
+  "overrides": {
+    "minimatch": "^11.0.1"
   }
 }

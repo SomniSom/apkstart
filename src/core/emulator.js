@@ -545,7 +545,9 @@ class EmulatorEngine {
       // размер и фокус ему ставит appwin.js через xdotool/wmctrl.
       // -no-window тут был бы фатальным: Android не выводит VSYNC в headless
       // и на экране будет пусто.
-      if (!gpu || gpu === 'host') args.push('-gpu-wrap');
+      // Never pass -gpu-wrap: the Android Emulator (37.x) rejects it with
+      // 'unknown option: -gpu-wrap' and exits with code 1. The window is created anyway,
+      // which is all we need (appwin.js sets title/size through xdotool/wmctrl).
     } else {
       // Never pass -no-skin: it overrides -skin and falls back to the config.ini panel size —
       // 'landscape selected but still portrait',

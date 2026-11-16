@@ -101,8 +101,9 @@ class AndroidSettings {
 
   /** Display size: change dpi; higher means bigger content (like the system 'display size' step) */
   async setDensity(dpi) {
-    const v = Math.max(120, Math.min(640, Math.round(Number(dpi) || 0)));
-    if (!v) return { ok: false };
+    const n = Number(dpi);
+    if (!Number.isFinite(n) || n <= 0) return { ok: false };
+    const v = Math.max(120, Math.min(640, Math.round(n)));
     await this._sh([`wm density ${v}`]);
     return { ok: true, density: v };
   }
@@ -137,9 +138,10 @@ class AndroidSettings {
     for (const line of lines) {
       if (/^\s*runtime permissions:/.test(line)) { inRuntime = true; continue; }
       if (!inRuntime) continue;
-      if (/^\s{0,6}\S/.test(line)) break;
       const m = /^\s+([A-Za-z0-9_.]+):\s*granted=(\w+)/.exec(line);
-      if (m) rows.push({ name: m[1], granted: m[2] === 'true' });
+      if (m) { rows.push({ name: m[1], granted: m[2] === 'true' }); continue; }
+      // A new section header (or the next package block) ends the runtime permission list
+      if (/^\s*\S.*:\s*$/.test(line) && !/granted=/.test(line)) break;
     }
     return rows;
   }
