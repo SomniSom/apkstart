@@ -57,12 +57,6 @@ linux:
       Comment: Android app runner
       Categories: Utility;
       MimeType: application/vnd.android.package-archive;
-  desktop:
-    entry:
-      Name: ApkStart
-      Comment: Android app runner
-      Categories: Utility;
-      MimeType: application/vnd.android.package-archive;
 
 appImage:
   artifactName: ApkStart-${version}-x86_64.AppImage
