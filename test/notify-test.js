@@ -1,5 +1,5 @@
 'use strict';
-// 用真实的 dumpsys 输出验证通知解析
+// Verify notification parsing against real dumpsys output
 const { app } = require('electron');
 const fs = require('fs');
 const path = require('path');

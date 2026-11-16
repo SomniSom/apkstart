@@ -1,133 +1,143 @@
-# ApkStart v0.3.5 发行说明
+# ApkStart v0.3.5 release notes
 
-> 本版在 v0.3.4 基础上修复了走读中确认的一系列缺陷，全部经过本机实测。
+> Fixes a set of defects found during a code walkthrough of v0.3.4; all verified locally.
 
-## 这一版解决什么
+## What this release fixes
 
-### 1. 2GB 以上的 APK 装不了（#21）
-旧版解析 APK 时把整个文件读进内存，2GB 以上会直接撞上 Node 的单 Buffer 上限，
-表现为「点了安装、弹个英文错误、右下角一直转圈」。
+### 1. APKs over 2 GB could not be installed (#21)
+The old parser read the whole file into memory and hit Node's single-Buffer limit above
+2 GB: the user clicked install, got an English error and an endless spinner.
 
-- 解析改为**文件版 ZIP 读取器**：只读中央目录，清单/资源表/图标按需读取，
-  峰值内存从「安装包大小」降到「几 MB」；
-- `.apks` / `.xapk` 拆分包同样改为流式解包（每个分片边解压边落盘），
-  失败时会清理临时目录；
-- `adb install` 的超时从固定 4 分钟改为**按包体放大**（2GB 包约 5 分钟，封顶 20 分钟），
-  避免大包在慢盘上被误判为失败；
-- 安装失败的提示统一从主进程事件出口发出，并清掉「正在安装…」的转圈提示，
-  报错后不会再残留一直转的进度条。
+- Parsing now uses a **file-backed ZIP reader**: only the central directory is read, and
+  the manifest / resource table / icon on demand, so peak memory drops from "size of the
+  package" to "a few MB";
+- `.apks` / `.xapk` bundles are unpacked as a stream (each part written as it decompresses)
+  and the temp dir is cleaned up on failure;
+- the `adb install` timeout is no longer a fixed 4 minutes but **scales with the package**
+  (~5 minutes for 2 GB, capped at 20), so a large APK on a slow disk is not reported as failed;
+- install failures are emitted from one place in the main process and clear the
+  "installing..." spinner, so a stuck progress bar is not left behind.
 
-### 2. 大镜像包 / 大更新包的 ZIP 兼容性
+### 2. ZIP compatibility for large runtime and update packages
 
-- 新增 **ZIP64** 支持（EOCD locator + 扩展字段 id=0x0001）：
-  条目数超过 65535 时不再静默丢条目，超大条目的偏移/大小也从扩展字段读取。
+- **ZIP64** support (EOCD locator + extra field id=0x0001): more than 65535 entries no
+  longer silently loses entries, and offsets/sizes of huge entries are read from the
+  extra field.
 
-### 3. 部署阶段「卡在准备运行时」/「停在 99% 又重下一套镜像」
+### 3. Setup stuck on "preparing the runtime" / "99% then re-downloading the image"
 
-- 选源测速从「30 秒内没有任何反馈」改为**逐个报进度**（第 i/n 个源），
-  单个源最多等 6 秒；端口不通只会排到最后，不影响下载；
-- 运行时整包下载前会先提示「正在获取运行时版本信息…」；
-- 系统镜像展开失败**不再被静默吞掉**：会明确报错并说明文件名，
-  不再出现「进度停在 99% → 又跳回去用官方源重下 1.4GB」；
-- 镜像展开改为**先写 `.part` 再原子改名**：中途断电/关程序不会留下一个
-  「看起来已完成」的半截 system.img；
-- 「已展开」的判定从「大于 32MB」改为「至少不小于压缩包大小」，
-  半截镜像会被重新展开；
-- 磁盘守卫补上运行时整包的估算（压缩包 1.5GB + 展开后 3.3GB，峰值同时存在），
-  空间不足会提前给出可操作的提示，而不是下到一半失败。
+- source probing now reports progress per candidate (i/n) instead of 30 silent seconds,
+  waiting at most 6 s per source; an unreachable port just sorts last;
+- before the runtime download the UI says "fetching runtime version info...";
+- a failed image unpack is **no longer swallowed**: it reports the file name instead of
+  "99% -> jump back and re-download 1.4 GB from the official source";
+- unpacking writes a `.part` file and renames it **atomically**: a crash or power cut
+  cannot leave a half-written `system.img` that looks complete;
+- "already unpacked" now means "at least as large as the archive", not ">32 MB", so a
+  truncated image is unpacked again;
+- the disk guard accounts for the runtime package (1.5 GB archive + 3.3 GB unpacked, both
+  present at the peak) and gives an actionable message up front.
 
-### 4. 设置里改了「运行时数据目录」，结果还是下到旧目录（#23）
+### 4. Changing "runtime data directory" still downloaded into the old one (#23)
 
-便携版程序目录旁带 `runtime/` 时，旧版会在启动时把用户手设的 `runtime.dir`
-覆盖成那个 bundled 运行时。现在：**只要用户显式指定过目录且里面有 emulator，
-就一律尊重**；只有「没设过」或「设的目录已经不可用」才会自动接管。
+When a portable build shipped with a `runtime/` next to the binary, startup overwrote a
+user-set `runtime.dir`. Now: **an explicitly set directory that contains an emulator is
+always respected**; auto-takeover happens only when nothing was set or the directory is
+no longer usable.
 
-### 5. 在线更新可能把 1.5GB 的运行时整包当成程序包
+### 5. Online update could install the 1.5 GB runtime package as the app
 
-发行版里同时挂着便携包与 `ApkStart-runtime-*.zip`。旧版兜底的 `.zip` 匹配
-没有排除后者，某次发布如果漏传便携包，更新器会把运行时整包解压进程序目录。
-现在兜底匹配明确排除 `runtime` 资产；没有可用资产时如实提示「请到发布页手动下载」。
+Releases carry both the portable package and `ApkStart-runtime-*.zip`. The fallback `.zip`
+match did not exclude the latter, so a release missing the portable package would unpack
+the runtime into the program directory. The fallback now excludes `runtime` assets and,
+when nothing is usable, tells the user to download manually from the release page.
 
-### 6. 开机失败后，诊断报告看不出原因（#20 / #25）
+### 6. A failed boot left no usable diagnosis (#20 / #25)
 
-旧版把「启动尝试记录 / 诊断结论」只放在内存里，用户重启 ApkStart 再导出报告，
-里面就是 `attempts: []`、`UNKNOWN`，只能让作者去翻日志。
+Attempts and the diagnosis lived only in memory, so restarting ApkStart and exporting a
+report gave `attempts: []` and `UNKNOWN`.
 
-- 启动失败时把 **attempts / 诊断结论 / 退出码** 落盘到
-  `%APPDATA%\apkstart\logs\last-failure.json`（下次开机成功会清掉）；
-- 诊断报告会带上落盘记录、退出码含义，以及 `emulator.log` 的尾部
-  （内存日志为空时直接从文件读最后 300 行）；
-- 新增 **`0xC0000005`（十进制 3221225477）诊断规则**：判定为「渲染后端崩溃」，
-  提示更新显卡驱动 / 降低画质，而不是含糊的「运行时未能完成开机」；
-- 遇到该类崩溃会**自动改用更保守的渲染后端重试并记住**
-  （`engine.badGpu`，按 emulator 版本失效），下次开机不再先撞一遍；
-- 设置页的运行时面板会直接显示「上次启动失败：…」，不用等导出报告。
+- on failure **attempts / diagnosis / exit code** are written to
+  `~/.local/share/apkstart/logs/last-failure.json` (cleared by the next successful boot);
+- the report includes the persisted record, the exit-code meaning and the tail of
+  `emulator.log` (the last 300 lines are read from disk when the in-memory log is empty);
+- new **`0xC0000005` (3221225477)** rule: classified as "renderer backend crash" with a
+  hint to update the graphics driver or lower quality, instead of a vague "runtime did
+  not finish booting";
+- on such a crash the engine **retries once with a more conservative backend and remembers
+  it** (`engine.badGpu`, invalidated per emulator version);
+- the runtime panel in Settings shows "last launch failed: ..." without exporting a report.
 
-### 7. 卸载 ApkStart 会抹掉用户原有的 .apk 文件关联
+### 7. Uninstalling ApkStart wiped the user's .apk association
 
-旧版取消关联时无条件清空 `.apk` 的默认程序（代码注释承诺的「仅当仍指向我们自己」
-并没有实现）。现在：
+The old code unconditionally cleared the default handler for `.apk` (the "only if it still
+points at us" promise in the comment was never implemented). Now:
 
-- 注册时把原有的默认程序记到 `HKCU\Software\ApkStart\assocPrev`；
-- 取消关联时**优先还原**它；没有记录且当前仍指向 ApkStart 才清空；
-- 本机实测：原关联是 `MuMuPlayer.apk`，注册 → 取消后原样还原。
+- on registration the previous handler is recorded in the app config;
+- on unregistration it is **restored first**; only with no record and a handler still
+  pointing at ApkStart is the entry cleared;
+- verified locally: previous handler restored unchanged.
 
-### 8. 图标：WebP 之外的格式与「用了占位图却不说」
+### 8. Icons: formats beyond WebP, and "placeholder without saying so"
 
-- 图标候选格式加入 `jpg/jpeg`；
-- 自适应图标 / `layer-list` 的 XML 现在会递归找位图（最多 3 层），
-  不再一律落到品牌占位图；
-- 真解不出来时，安装完成提示里会明确说「图标无法解析，快捷方式暂时使用占位图标」，
-  而不是让用户看着一个绿色三角猜。
+- `jpg/jpeg` added to the icon candidates;
+- adaptive icons and `layer-list` XML now search nested bitmaps recursively (up to 3
+  levels) instead of always falling back to the brand placeholder;
+- when the icon really cannot be decoded, the install message says "the icon could not be
+  parsed; the shortcut uses a placeholder" instead of leaving the user with a green triangle.
 
-### 9. 全新安装后点桌面图标，只看到安卓桌面
+### 9. After a fresh install the desktop shortcut showed only the Android home screen
 
-实测发现的上游 bug（v0.3.4 也存在）：装完应用后 `apps.json` 里记录的启动入口是
-「完整组件」（`com.foo.bar/com.foo.bar/.MainActivity`），而启动时又拼了一次包名，
-`am start -n` 拿到的是 `com.foo.bar/com.foo.bar/com.foo.bar/.MainActivity`，
-系统直接取消启动（日志 `result code=-92`）——窗口里就是安卓桌面。
+An upstream bug (also present in v0.3.4): `apps.json` stores the launch entry as a full
+component (`com.foo.bar/com.foo.bar/.MainActivity`) and the launcher prefixed the package
+again, so `am start -n` received
+`com.foo.bar/com.foo.bar/com.foo.bar/.MainActivity` and the system cancelled the launch
+(`result code=-92`) — the window showed the home screen.
 
-- 新增 `componentArg()`：完整组件原样使用，纯类名才补包名；两种历史数据都兼容；
-- `parseResolvedActivity()` 改为扫全部行（`resolve-activity` 输出末尾常带空行），
-  不再因为最后一行是空串而误判为「解析不到」；
-- 实测：重装红果后点桌面图标，`mCurrentFocus` 正确落到
-  `com.phoenix.read/...SplashActivity`，窗口里是应用自己的界面（不再是桌面）。
+- new `componentArg()`: a full component is used as is, a bare class name gets the package
+  prefixed; both legacy shapes work;
+- `parseResolvedActivity()` scans all lines (the `resolve-activity` output often ends with
+  a blank line) instead of bailing on a trailing empty string;
+- verified: after reinstalling, `mCurrentFocus` lands on the app's splash activity and the
+  window shows the app, not the home screen.
 
-### 10. 日志滚动边界
+### 10. Log rotation edge case
 
-- 日志文件名不以 `.log` 结尾时，滚动会「先删后改名」导致日志丢失；
-  现在直接跳过滚动（宁可日志大一点，也不丢）。
+When the log file name does not end in `.log`, rotation deleted before renaming and lost
+the log; rotation is now skipped instead.
 
-### 11. 其它
-- 新增「合成 APK」测试夹具（`test/lib/make-apk.js`）：自造二进制 AXML 清单 +
-  PNG 图标 + ABI 目录，真实 APK 夹具缺失时解析栈也有覆盖；
-- 新增/扩充回归用例：Zip64、.xapk 拆分包、materializeImages、
-  更新资产选择、`0xC0000005` 诊断、日志边界、失败记录落盘、WebP 图标降级；
-- `npm test` 从 98 项增至 **113 项全绿**。
+### 11. Other
+- new synthetic-APK fixture (`test/lib/make-apk.js`): a hand-built binary AXML manifest +
+  PNG icon + ABI dirs, so the parser is covered even without a real APK;
+- new/expanded regression cases: Zip64, `.xapk` bundles, materializeImages, update asset
+  selection, the `0xC0000005` diagnosis, log boundaries, persisted failures, WebP fallback;
+- `npm test` went from 98 to **113 green checks**.
 
-## 验证记录
+## Verified
 
-| 项目 | 结果 |
+| Check | Result |
 |---|---|
-| `npm test` | 113 通过 / 0 失败（8 + 25 + 80） |
-| `electron test/electron-integration.js` | ICO / .lnk / WebP 降级全部通过 |
-| 真实冷启动 | 25.0s 就绪（`sys.boot_completed=1`） |
-| 命中快照 | 5~6s |
-| 优雅关机 | `code=0`，`hasSnapshot=true` |
-| 真机 APK 解析 | 红果短剧 7.4.3.32 / `res/b/a3.webp` / arm64-v8a 正确 |
-| 2.15GB APK 解析 | 18ms 完成，进程 RSS 47MB（旧版需把整个 2.2GB 读进内存） |
-| 全新安装 + 桌面图标启动 | 重装红果后点图标：`mCurrentFocus` = `com.phoenix.read/...SplashActivity`，窗口内是应用界面（修复前是安卓桌面） |
-| 运行时自检 `npm run selftest -- --apk` | **13 项全过**：adb / 引擎 / 镜像 / AEHD、Android 14 API34、freeform、共享目录双向同步、解析→安装→独立窗口启动→截图 |
-| `tools/check-launch-clean.js` | 安装 + 打开全程：应用窗口 **0.5 秒出现**，模拟器/控制台窗口累计出现 **0 次** |
-| 安装链路 | 打包版拖入 153MB APK：22s 完成解析/安装/图标/快捷方式；桌面 + 开始菜单 .lnk 的 Target/Args/Icon 均正确 |
-| 窗口不泄漏 | `check-quit-clean`：开机全程 + 退出后 8 秒，可见的模拟器/控制台窗口 **0 个** |
-| 注册表关联 | 本机原关联 `MuMuPlayer.apk`，注册→取消后原样还原 |
-| 打包版 | 226MB 便携包，界面冒烟通过 |
+| `npm test` | 113 passed / 0 failed (8 + 25 + 80) |
+| `electron test/electron-integration.js` | ICO / .lnk / WebP fallback all pass |
+| Real cold boot | ready in 25.0 s (`sys.boot_completed=1`) |
+| Snapshot hit | 5-6 s |
+| Graceful shutdown | `code=0`, `hasSnapshot=true` |
+| Real APK parsing | label, WebP icon and arm64-v8a parsed correctly |
+| 2.15 GB APK parsing | 18 ms, process RSS 47 MB (the old code needed 2.2 GB of RAM) |
+| Fresh install + shortcut launch | `mCurrentFocus` on the app's splash activity; app UI in the window |
+| `npm run selftest -- --apk` | **13 checks passed**: adb / engine / image / KVM, Android 14 API 34, freeform, two-way shared folder, parse -> install -> window -> screenshot |
+| `tools/check-launch-clean.js` | during install + launch: app window in **0.5 s**, emulator/console windows **0** |
+| Install path | a 153 MB APK dropped in: 22 s for parse/install/icon/shortcut; Target/Args/Icon correct |
+| No leaked windows | `check-quit-clean`: nothing visible during boot and 8 s after exit |
+| Association | previous handler restored unchanged after register -> unregister |
+| Packaged build | 226 MB portable build, UI smoke test passed |
 
-## 已知限制
+## Known limitations
 
-- `0xC0000005` 的**根因**仍在显卡驱动 / Vulkan 后端一侧，这一版做的是
-  「自动换后端 + 把原因写清楚」；某台机器若仍然必崩，把新的诊断报告发出来即可定位。
-- 图标解析仍不支持 `shape`/矢量 drawable（会走占位图，并如实提示）。
-- `.apk` 关联写在 HKCU（免管理员）；如果系统里有其它程序反复抢回关联，
-  以系统「默认应用」设置为准。
+- The **root cause** of `0xC0000005` is still in the graphics driver / Vulkan backend; this
+  release switches the backend and explains the failure. A machine that still crashes
+  reliably should send the new diagnostic report.
+- Icon parsing still does not support `shape` / vector drawables (placeholder, reported
+  as such).
+- The `.apk` association is written per user; if another program keeps stealing it, the
+  system "Default applications" setting wins.

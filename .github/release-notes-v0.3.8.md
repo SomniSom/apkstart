@@ -1,62 +1,75 @@
 # ApkStart v0.3.8
 
-> 一句话：加了一张**好看的启动欢迎卡**（开机自启时提醒你一切就绪），修好了**部分用户检查不到更新**，新增**清理旧版本残留**，并把界面整体美化了一轮。
+> One line: a **welcome card on start** (reminds you everything is ready when the app
+> autostarts), fixed **update checks failing for some users**, new **cleanup of old version
+> leftovers**, and a visual refresh of the whole UI.
 
-## 一、新增：启动欢迎卡
+## 1. New: welcome card on start
 
-开机自启或打开 ApkStart 时，弹一张轻量的欢迎卡：
+When the app starts (or autostarts with the session) a light welcome card appears:
 
-- 顶部是品牌渐变头图 + 动态问候（早上好 / 下午好 / 夜深了…）；
-- 三个指标一目了然：**已装应用 / 安卓运行时状态 / 设备端口**；
-- 有两条当下最有用的提示（没装应用时教怎么装；装了应用时教窗口操作）；
-- 发现新版本时，会在这里直接提示，不再另外弹右下角气泡；
-- 底部可以勾 **「下次启动不再自动弹出」**，也可以直接「打开设置」。
+- brand gradient header plus a time-aware greeting;
+- three figures at a glance: **installed apps / Android runtime state / device port**;
+- the two most useful hints right now (how to install an app when none is installed; how
+  the window controls work when there are apps);
+- a new version is announced here instead of a separate toast;
+- a **"do not show again on start"** checkbox and a shortcut to Settings.
 
-弹出规则：开机自启必弹；手动打开则每天最多一次；勾选后永久不弹。
+Rules: always on autostart; at most once a day when opened manually; never after the
+checkbox is ticked.
 
-## 二、修复：部分用户检查不到更新
+## 2. Fix: some users could not check for updates
 
-**原因**：版本信息依赖两家的 API。GitHub 匿名 API 每 IP 每小时只有 60 次；Gitee 的匿名 API 更紧，实测连续几次就返回 `403 Rate Limit Exceeded`。公司网 / 校园网 / 运营商 NAT 出口下用户很容易两个源都被限流，界面就只会显示「检查更新失败」。
+**Cause**: version info depended on both providers' APIs. The anonymous GitHub API allows
+60 requests per IP per hour, Gitee's anonymous API is stricter and returned
+`403 Rate Limit Exceeded` after a few calls. Behind a company, campus or carrier NAT both
+sources can be rate-limited, and the UI only showed "update check failed".
 
-**修复**：
+**Fix**:
 
-- 新增**不依赖 API 的兜底**：直接跟随 `releases/latest` 的 302 跳转拿版本号（走 CDN，不消耗 API 额度），再按发布约定拼出下载地址；
-- GitHub 和 Gitee 的 `/releases/download/<tag>/<文件名>` 规范地址都支持拼装（实测 Gitee 会 302 到附件直链，能下到完整字节）；
-- 检查失败时，界面不再是一片空白，而是给一个 **「打开下载页」** 按钮；`app:updateOpen` 现在也放行 `gitee.com`，国内用户不会被挡。
+- **API-free fallback**: follow the `releases/latest` 302 redirect to read the tag (served
+  from the CDN, no API quota) and build the download URL from the release convention;
+- both GitHub and Gitee `/releases/download/<tag>/<file>` URLs can be assembled (Gitee
+  redirects to the attachment, which downloads fine);
+- on failure the UI is no longer blank but offers an **"open the download page"** button,
+  and `app:updateOpen` now allows `gitee.com`.
 
-## 三、新增：清理旧版本残留
+## 3. New: cleanup of old version leftovers
 
-设置 → 系统集成 → **「清理旧版本残留」**：
+Settings -> System integration -> **"Clean up old version leftovers"**:
 
-- 扫描**旧版本程序目录**（同目录下的 `ApkStart-vX.Y.Z-win64-portable` 等，且必须真的含 `ApkStart.exe`，绝不碰当前正在运行的版本）；
-- 扫描**已失效的注册表卸载项**（`InstallLocation` 或卸载程序已经不存在的死条目）；
-- 扫描**更新下载留下的临时包**（`%APPDATA%\apkstart\update` 与临时目录里的 `ApkStart-*.zip` 等）；
-- 先列出清单和可释放空间，确认后再删，并如实报告「几项被占用没删掉」。
+- scans **old program directories** (sibling `ApkStart-vX.Y.Z-*` folders that really
+  contain the binary, never the running version);
+- scans **dead uninstall entries** whose program or uninstaller no longer exists;
+- scans **leftover update packages** in the update cache and the temp dir;
+- lists everything with the reclaimable space first and deletes only after confirmation,
+  reporting items that were busy.
 
-只做可证明安全的清理，**不动用户数据、不动当前版本**。
+Only provably safe things are removed: never user data, never the running version.
 
-## 四、隐藏启动时的零碎小弹窗
+## 4. No more startup popups
 
-- 启动时的「发现新版本」系统通知已取消，统一收进欢迎卡；
-- 之前的启动提示分散在多个 toast / 气泡里，现在只有这一张卡片；
-- 控制台黑窗压制逻辑保持（模拟器 / netsimd / adb 的控制台窗口仍会被隐藏）。
+- the "new version found" system notification is gone, folded into the welcome card;
+- the previous scattered startup toasts collapsed into that single card;
+- console-window suppression is unchanged.
 
-## 五、界面美化
+## 5. Visual refresh
 
-- 全新配色：翡翠绿品牌色 + 柔和中性底，背景带一层很淡的品牌光晕；
-- 标题栏改为**磨砂玻璃**质感，窗口图标换成矢量品牌标记（小尺寸下也认得出是"播放键"，不再是糊成一团的深色方块）；
-- 应用卡片：更大圆角、悬停上浮 + 品牌色描边、图标带投影；
-- 按钮：主按钮渐变 + 内高光，次级按钮更轻；
-- 模态框、分组标题、滚动条、状态栏统一重做；
-- 欢迎卡是同一套设计语言（渐变头图 + 光晕 + 点阵纹理）。
+- new palette: emerald brand colour on a soft neutral base with a faint brand glow;
+- frosted-glass title bar and a vector brand mark that still reads as a play key at small sizes;
+- app cards with larger radii, hover lift, brand outline and icon shadow;
+- primary buttons with a gradient and inner highlight, quieter secondary buttons;
+- modals, section headings, scrollbars and the status bar redone consistently;
+- the welcome card uses the same design language.
 
-## 六、实测
+## 6. Verified
 
-- `npm test`：**113 项全部通过**（8 + 25 + 80）。
-- 冒烟截图验证：主界面与欢迎卡均正常渲染（见发布页截图）。
-- 「清理旧版本残留」在开发机上扫出 6 个旧版本目录、约 1.3 GB，当前运行版本被正确排除。
+- `npm test`: **113 checks passed** (8 + 25 + 80).
+- Smoke screenshots: main window and welcome card render correctly.
+- The cleanup found 6 old version directories (~1.3 GB) on the dev machine and correctly
+  excluded the running version.
 
-## 七、升级方式
+## 7. Upgrading
 
-- 便携版：解压覆盖，数据目录（默认 `%APPDATA%\apkstart`）保持不变。
-- 安装版：直接安装覆盖。
+- Portable: unpack over the old copy; the data directory is untouched.
+- Installed build: install over the old version.

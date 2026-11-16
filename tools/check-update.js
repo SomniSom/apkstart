@@ -1,12 +1,12 @@
 'use strict';
 /**
- * 更新链路自检（不需要真的发布新版本、也不会动到当前安装）。
+ * Update-path self-check (no real release needed, the current install is untouched).
  *
- * 1) 能不能读到 GitHub 最新 release，并对当前形态挑到正确的资产；
- * 2) 版本比较逻辑；
- * 3) 「解压 + 覆盖 + 重启」脚本是真的能跑：造一个假安装目录，让脚本去覆盖它。
+ * 1) can the latest GitHub release be read and the right asset picked for this flavour;
+ * 2) version comparison;
+ * 3) the unpack/overwrite/restart script really runs: a fake install dir is overwritten.
  *
- * 用法: node tools/check-update.js
+ * Usage: node tools/check-update.js
  */
 const fs = require('fs');
 const os = require('os');
@@ -21,10 +21,10 @@ const ok = (c, m) => console.log(`${c ? '✓' : '✗'} ${m}`);
   let pass = true;
   const check = (c, m) => { ok(c, m); if (!c) pass = false; };
 
-  // ---- 1. 版本比较 ----
+  // ---- 1. version comparison ----
   check(cmpVer('v0.3.2', '0.3.1') === 1, 'v0.3.2 > 0.3.1');
-  check(cmpVer('0.3.1', 'v0.3.1') === 0, 'v 前缀不影响相等');
-  check(cmpVer('v0.10.0', '0.9.9') === 1, '0.10.0 > 0.9.9（按数字比，不是字符串）');
+  check(cmpVer('0.3.1', 'v0.3.1') === 0, 'a v prefix does not affect equality');
+  check(cmpVer('v0.10.0', '0.9.9') === 1, '0.10.0 > 0.9.9 (numeric, not string comparison)');
   check(cmpVer('1.0.0', '1.0.1') === -1, '1.0.0 < 1.0.1');
 
   // ---- 2. GitHub release ----
@@ -41,14 +41,14 @@ const ok = (c, m) => console.log(`${c ? '✓' : '✗'} ${m}`);
   let info = null;
   try {
     info = await u.check();
-    check(!!info && !!info.version, `读取到最新版本 ${info && info.tag}`);
-    check(info.hasUpdate === true, '当前版本 0.0.0 → 判定有更新');
-    check(!!info.asset && /\.(zip|exe)$/i.test(info.asset.name), `便携形态挑到资产 ${info.asset && info.asset.name}`);
+    check(!!info && !!info.version, `latest version read: ${info && info.tag}`);
+    check(info.hasUpdate === true, '0.0.0 -> an update is detected');
+    check(!!info.asset && /\.(zip|AppImage|tar\.gz)$/i.test(info.asset.name), `portable flavour picks ${info.asset && info.asset.name}`);
   } catch (e) {
-    check(false, `GitHub 检查失败：${e.message}`);
+    check(false, `GitHub check failed: ${e.message}`);
   }
 
-  // 安装形态（有卸载器）应当挑 Setup.exe
+  // An installed flavour should pick the installer artifact
   fs.writeFileSync(path.join(install, 'Uninstall ApkStart.exe'), 'stub');
   const u2 = new Updater({
     currentVersion: '0.0.0',
@@ -56,26 +56,26 @@ const ok = (c, m) => console.log(`${c ? '✓' : '✗'} ${m}`);
     isPackaged: true,
     dataDir: sandbox,
   });
-  check(u2.flavor === 'setup', '识别为安装版（存在 Uninstall ApkStart.exe）');
+  check(u2.flavor === 'setup', 'detected an installed flavour');
 
-  // ---- 3. 覆盖脚本真的能跑 ----
+  // ---- 3. the overwrite script really runs ----
   const payload = path.join(sandbox, 'payload');
   fs.mkdirSync(path.join(payload, 'resources', 'app'), { recursive: true });
   fs.writeFileSync(path.join(payload, 'ApkStart.exe'), 'new-exe');
   fs.writeFileSync(path.join(payload, 'resources', 'app', 'main.js'), 'new-main');
   fs.writeFileSync(path.join(install, 'ApkStart.exe'), 'old-exe');
 
-  // 用一个立刻会退出的进程当「被等待的旧进程」
+  // Use a process that exits at once as the "old process" being waited on
   const decoy = spawn(process.execPath, ['-e', 'setTimeout(()=>{},1500)'], { stdio: 'ignore' });
 
   const script = u.apply(
     { mode: 'zip', payload, version: '9.9.9' },
     { waitPid: decoy.pid, spawn: false },
   );
-  check(/Copy-Item/.test(script) && /Wait-Process/.test(script), '脚本包含等待进程与覆盖动作');
+  check(/while kill/.test(script) && /cp |tar /.test(script), 'the script waits and overwrites');
 
   const ps = path.join(process.env.SystemRoot || 'C:\\Windows', 'System32', 'WindowsPowerShell', 'v1.0', 'powershell.exe');
-  // 不真去 Start-Process 拉起 ApkStart.exe（那是个假 exe），只验证复制
+  // Do not actually launch the fake binary; only verify the copy step
   const body = script.replace(/if \(Test-Path[^\r\n]*relaunched' \}/, "'skipped relaunch'");
   const b64 = Buffer.from(body, 'utf16le').toString('base64');
   try {
@@ -83,15 +83,15 @@ const ok = (c, m) => console.log(`${c ? '✓' : '✗'} ${m}`);
       stdio: 'ignore', timeout: 60000, windowsHide: true,
     });
   } catch (e) {
-    check(false, `覆盖脚本执行失败：${e.message}`);
+    check(false, `overwrite script failed: ${e.message}`);
   }
   await sleep(600);
   const newExe = fs.readFileSync(path.join(install, 'ApkStart.exe'), 'utf8');
   const newMain = fs.readFileSync(path.join(install, 'resources', 'app', 'main.js'), 'utf8');
-  check(newExe === 'new-exe', '安装目录里的 ApkStart.exe 已被替换');
-  check(newMain === 'new-main', '子目录里的文件也替换成功');
+  check(newExe === 'new-exe', 'the binary in the install dir was replaced');
+  check(newMain === 'new-main', 'files in subdirectories are replaced too');
 
-  // ---- 4. apply() 真的起一个进程去替换（异步链路，不走网络）----
+  // ---- 4. apply() spawns a process to swap files (async, no network) ----
   const install2 = path.join(sandbox, 'install2');
   const payload2 = path.join(sandbox, 'payload2');
   fs.mkdirSync(install2, { recursive: true });
@@ -114,15 +114,15 @@ const ok = (c, m) => console.log(`${c ? '✓' : '✗'} ${m}`);
     await sleep(500);
     try {
       if (fs.readFileSync(path.join(install2, 'marker.txt'), 'utf8') === 'new') { asyncOk = true; break; }
-    } catch (_) { /* 还在替换 */ }
+    } catch (_) { /* still replacing */ }
   }
-  check(asyncOk, 'apply() 在后台进程里完成了替换（异步链路可用）');
+  check(asyncOk, 'apply() completed in a background process (async path works)');
 
   try { decoy.kill(); } catch (_) { /* ignore */ }
   try { decoy2.kill(); } catch (_) { /* ignore */ }
   fs.rmSync(sandbox, { recursive: true, force: true });
 
   console.log('');
-  console.log(pass ? '结果：通过' : '结果：有失败项');
+  console.log(pass ? 'result: pass' : 'result: failures');
   process.exit(pass ? 0 : 1);
 })().catch((e) => { console.error('FATAL', e); process.exit(1); });

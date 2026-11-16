@@ -1,12 +1,13 @@
 'use strict';
 /**
- * 运行时自检（不需要打开界面）
+ * Runtime self-check (no UI needed)
  *
- *   npm run selftest                 # 只体检现有运行时
- *   npm run selftest -- --apk a.apk  # 额外走一遍 安装 → 启动 → 截图 → 共享目录
+ *   npm run selftest                 # check the existing runtime only
+ *   npm run selftest -- --apk a.apk  # also run install -> launch -> screenshot -> shared dir
  *
- * 用途：装好 Android 之后，用一条命令确认「双击装应用、独立窗口、数据互通」这条链路
- * 在当前机器上真的成立，出问题时也能定位到具体环节。
+ * Purpose: after Android is installed, one command proves that "double-click installs,
+ * a standalone window opens, data flows both ways" really works on this machine, and
+ * pinpoints the failing step when it does not.
  */
 const fs = require('fs');
 const os = require('os');
@@ -23,7 +24,7 @@ const argOf = (name) => {
   return i >= 0 ? argv[i + 1] : '';
 };
 const APK = argOf('--apk');
-// 留空 = 走产品路径自动拉起内置运行时并用动态 serial；指定时才连接外部设备
+// Empty = use the product path (start the built-in runtime, dynamic serial); set to use an external device
 const SERIAL = argOf('--serial') || '';
 
 const results = [];
@@ -47,68 +48,68 @@ async function step(name, fn) {
 }
 
 (async () => {
-  console.log('\nApkStart 运行时自检');
-  console.log(`设备：${SERIAL}`);
+  console.log('\nApkStart runtime self-check');
+  console.log(`device: ${SERIAL}`);
   console.log('─'.repeat(64));
 
-  console.log('\n[组件]');
+  console.log('\n[components]');
   const runtime = new Runtime(path.join(__dirname, '..'));
   const prov = runtime.provisioner;
 
   let env = null;
-  await step('adb 可用', async () => {
+  await step('adb available', async () => {
     env = await prov.checkEnv();
-    if (!env.adb.ok) throw new Error('未安装 adb，请先运行「一键部署」');
+    if (!env.adb.ok) throw new Error('adb is not installed; run the one-click setup first');
     return `v${env.adb.version}`;
   });
-  await step('Android Emulator 就绪', async () => {
-    if (!env.emulator.ok) throw new Error('未安装运行时引擎，请先运行「一键部署」');
+  await step('Android emulator ready', async () => {
+    if (!env.emulator.ok) throw new Error('the runtime engine is not installed; run the one-click setup first');
     return `v${env.emulator.version}`;
   });
-  await step('系统镜像完整', async () => {
-    if (!env.sysimg.ok) throw new Error(env.sysimg.note || '镜像缺失');
+  await step('system image complete', async () => {
+    if (!env.sysimg.ok) throw new Error(env.sysimg.note || 'the system image is missing');
     return `Android ${env.sysimg.api} · ${(env.sysimg.size / 1073741824).toFixed(2)}GB`;
   });
-  record('硬件加速', env.accel.ok ? true : null,
-    env.accel.ok ? env.accel.note : '自动回退软件模拟（能跑，但明显慢）');
+  record('hardware acceleration', env.accel.ok ? true : null,
+    env.accel.ok ? env.accel.note : 'falling back to software emulation (works, but slow)');
 
-  console.log('\n[设备]');
+  console.log('\n[device]');
   let client = runtime.client(SERIAL || undefined);
-  const online = await step('运行时已就绪', async () => {
+  const online = await step('runtime ready', async () => {
     if (SERIAL) {
       await client.connect().catch(() => false);
-      if (!await client.isOnline()) throw new Error(`外部设备不在线：${SERIAL}`);
+      if (!await client.isOnline()) throw new Error(`external device is offline: ${SERIAL}`);
       return SERIAL;
     }
     const r = await runtime.ensure({ onLog: () => {} });
-    if (!r.ok) throw new Error(r.error || '运行时不可用');
+    if (!r.ok) throw new Error(r.error || 'the runtime is unavailable');
     client = r.client;
     return client.serial;
   });
 
   if (!online) {
-    console.log('\n设备未就绪，后续项目跳过。');
+    console.log('\nthe device is not ready, skipping the rest.');
   } else {
-    await step('Android 版本', async () => {
+    await step('Android version', async () => {
       const [ver, sdk, abi] = await Promise.all([
         client.androidVersion(), client.sdkInt(), client.shell('getprop ro.product.cpu.abi').catch(() => ''),
       ]);
-      if (!ver) throw new Error('读不到系统版本');
+      if (!ver) throw new Error('cannot read the system version');
       return `Android ${ver} (API ${sdk}) · ${String(abi).trim()}`;
     });
-    await step('屏幕分辨率', async () => {
+    await step('screen resolution', async () => {
       const s = await client.wmSize();
-      if (!s) throw new Error('wm size 无返回');
+      if (!s) throw new Error('wm size returned nothing');
       return `${s.width}×${s.height}`;
     });
-    await step('freeform 独立窗口', async () => {
+    await step('freeform standalone window', async () => {
       const ok = await client.ensureFreeform();
-      if (!ok) throw new Error('无法开启 freeform（系统可能不支持多窗口）');
-      return '已开启';
+      if (!ok) throw new Error('cannot enable freeform (multi-window may be unsupported)');
+      return 'enabled';
     });
 
-    console.log('\n[共享目录]');
-    await step('双向同步', async () => {
+    console.log('\n[shared folder]');
+    await step('two-way sync', async () => {
       const sharer = new Sharer(runtime);
       await client.shellMkdir(store.getSettings().deviceSharedDir);
       const localDir = store.getSettings().sharedDir;
@@ -121,74 +122,74 @@ async function step(name, fn) {
       if (up.errors && up.errors.length) throw new Error(up.errors[0]);
       const remote = `${store.getSettings().deviceSharedDir}/${path.basename(probe)}`;
       const back = await client.shell(`cat "${remote}" 2>/dev/null`);
-      if (!String(back).includes('apkstart selftest')) throw new Error('本机 → 设备 未同步');
+      if (!String(back).includes('apkstart selftest')) throw new Error('host -> device did not sync');
 
       const reverse = path.join(localDir, `selftest-from-device-${Date.now()}.txt`);
       await client.shell(`echo device-side > "${store.getSettings().deviceSharedDir}/${path.basename(reverse)}"`);
       await sharer.sync();
       if (!fs.existsSync(reverse) || !fs.readFileSync(reverse, 'utf8').includes('device-side')) {
-        throw new Error('设备 → 本机 未同步');
+        throw new Error('device -> host did not sync');
       }
       fs.rmSync(probe, { force: true });
       fs.rmSync(reverse, { force: true });
       await client.shell(`rm -f "${remote}"`);
-      return '上行 + 下行均正常';
+      return 'both directions work';
     });
 
     if (APK) {
-      console.log('\n[应用链路]');
+      console.log('\n[app flow]');
       let meta = null;
-      await step('解析 APK', async () => {
+      await step('parse the APK', async () => {
         meta = parseApk(APK);
         return `${meta.label} (${meta.package} v${meta.versionName})`;
       });
       if (meta) {
-        await step('安装到设备', async () => {
+        await step('install on the device', async () => {
           await client.install(APK);
           const installed = await client.isInstalled(meta.package);
-          if (!installed) throw new Error('pm path 未找到包');
-          return 'pm path 校验通过';
+          if (!installed) throw new Error('pm path did not find the package');
+          return 'pm path verified';
         });
-        await step('独立窗口启动', async () => {
+        await step('standalone window launch', async () => {
           await client.startApp(meta.package, meta.launchActivity, { freeform: true });
           await sleep(4000);
           const top = await client.shell('dumpsys activity activities | grep -E "mResumedActivity|topResumedActivity"');
-          if (!String(top).includes(meta.package)) throw new Error('应用未在前台');
+          if (!String(top).includes(meta.package)) throw new Error('the app is not in the foreground');
           return meta.package;
         });
-        await step('截图', async () => {
+        await step('screenshot', async () => {
           const png = await client.screenshot();
           const out = path.join(__dirname, '..', 'test', 'out');
           fs.mkdirSync(out, { recursive: true });
           const file = path.join(out, 'selftest.png');
           fs.writeFileSync(file, png);
-          if (png.length < 4096) throw new Error('截图内容异常');
+          if (png.length < 4096) throw new Error('the screenshot looks wrong');
           return file;
         });
       }
     } else {
-      console.log('\n[应用链路] 未指定 --apk，跳过');
+      console.log('\n[app flow] no --apk given, skipped');
     }
   }
 
-  // 自检自己拉起的运行时要主动停掉：否则 emulator 子进程的 stdio 管道
-  // 会让 Node 事件循环一直不退出，命令看起来「卡住」
+  // Stop a runtime this script started: otherwise the emulator's stdio pipes
+  // keep the Node event loop alive and the command appears to hang
   if (!SERIAL && runtime.emulator.running()) {
     await runtime.stop({}).catch(() => {});
   }
 
   const failed = results.filter((r) => r.ok === false);
   console.log('\n' + '─'.repeat(64));
-  console.log(`结果：${results.filter((r) => r.ok === true).length} 通过，${failed.length} 失败，`
-    + `${results.filter((r) => r.ok === null).length} 跳过`);
+  console.log(`result: ${results.filter((r) => r.ok === true).length} passed, ${failed.length} failed, `
+    + `${results.filter((r) => r.ok === null).length} skipped`);
   if (failed.length) {
-    console.log('失败项：');
+    console.log('failures:');
     failed.forEach((f) => console.log(`  · ${f.name}：${f.detail}`));
     process.exit(1);
   }
-  console.log('全部检查通过 ✅\n');
+  console.log('all checks passed\n');
   process.exit(0);
 })().catch((e) => {
-  console.error('\n自检异常终止：', e.message);
+  console.error('\nself-check aborted:', e.message);
   process.exit(1);
 });

@@ -6,10 +6,14 @@ on:
   pull_request:
   workflow_dispatch:
 
+env:
+  # Unit tests need no Electron binary: skip the 188 MB download
+  ELECTRON_SKIP_BINARY_DOWNLOAD: '1'
+
 jobs:
   test:
-    name: 单元测试（Windows / Node ${{ matrix.node }}）
-    runs-on: windows-latest
+    name: tests (Node ${{ matrix.node }})
+    runs-on: ubuntu-latest
     strategy:
       fail-fast: false
       matrix:
@@ -23,20 +27,88 @@ jobs:
           node-version: ${{ matrix.node }}
           cache: npm
 
-      # 单元测试不需要 Electron 二进制，跳过 188MB 下载以加快 CI
-      - name: 安装依赖
+      - name: Install dependencies
         run: npm ci
-        env:
-          ELECTRON_SKIP_BINARY_DOWNLOAD: '1'
 
-      - name: 运行测试
+      - name: Run tests
         run: npm test
 
-      # 直接驱动 agent.ps1 内嵌 C# 的钩子回调，防止键位映射被改坏
-      - name: 鼠标钩子逻辑冒烟测试
-        shell: powershell
+      - name: Check syntax of every module
         run: |
-          Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass -Force
-          $out = & .\test\pointer-hook-logic.ps1
-          $out | ForEach-Object { Write-Host $_ }
-          if (-not ($out -contains 'POINTER_HOOK_LOGIC_OK')) { exit 1 }
+          find src build scripts tools test -name '*.js' -print0 \
+            | xargs -0 -n1 node --check
+
+  lint-links:
+    name: documentation links
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - name: Fail on broken relative links in markdown
+        run: |
+          node <<'NODE'
+          const fs = require('fs');
+          const path = require('path');
+          const glob = (dir, out = []) => {
+            for (const e of fs.readdirSync(dir, { withFileTypes: true })) {
+              const p = path.join(dir, e.name);
+              if (e.isDirectory()) {
+                if (['node_modules', '.git', 'dist'].includes(e.name)) continue;
+                glob(p, out);
+              } else if (e.name.endsWith('.md')) out.push(p);
+            }
+            return out;
+          };
+          const broken = [];
+          for (const f of glob('.')) {
+            const txt = fs.readFileSync(f, 'utf8');
+            const targets = [];
+            for (const m of txt.matchAll(/!?\[[^\]]*\]\(([^)\s]+)\)/g)) targets.push(m[1]);
+            for (const m of txt.matchAll(/<img[^>]+src="([^"]+)"/g)) targets.push(m[1]);
+            for (const t of targets) {
+              if (/^(https?:|mailto:|#|data:)/.test(t)) continue;
+              const p = path.normalize(path.join(path.dirname(f), t.split('#')[0]));
+              if (!fs.existsSync(p)) broken.push(`${f}: ${t}`);
+            }
+          }
+          if (broken.length) {
+            console.error('Broken links:\n' + broken.join('\n'));
+            process.exit(1);
+          }
+          console.log('All relative markdown links resolve.');
+          NODE
+
+  build:
+    name: package (deb + AppImage)
+    runs-on: ubuntu-latest
+    needs: test
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci
+
+      # No runtime is bundled: the app downloads adb / emulator / image on first launch,
+      # which keeps the artifact small and the build within a few minutes.
+      - name: Build .deb and AppImage
+        run: npx electron-builder --linux deb AppImage --publish never
+
+      - name: Show artefacts
+        run: ls -lh dist/release
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: apkstart-linux
+          path: |
+            dist/release/*.deb
+            dist/release/*.AppImage
+          if-no-files-found: error

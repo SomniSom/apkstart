@@ -1,18 +1,18 @@
 'use strict';
 /**
- * 在线更新：从 GitHub Releases（RoutineMiku/apkstart）取最新版本，下载并原地替换。
+ * Онлайн-обновление: берём последнюю версию из GitHub Releases, скачиваем и заменяем на месте.
+ * На Linux это AppImage или каталог сборки; замена идёт через sh-скрипт,
+ * который ждёт выхода процесса, копирует файлы и запускает новую версию.
  *
- * 三个形态都要照顾到：
- *   - 安装版（NSIS）：下载 `ApkStart-x.y.z-Setup.exe`，静默安装（/S）；
- *   - 轻量版（便携 zip，运行时按需下载）：下载 `ApkStart-vX-win64-portable.zip`，
- *     解压后覆盖程序目录 —— 运行时目录（%APPDATA%\apkstart\runtime）与已装应用、
- *     快照全都在用户目录里，替换程序文件不会动它们；
- *   - 完整版（便携但带 runtime）：同轻量版，只是目录里多了 resources\runtime。
+ * Three delivery shapes are covered:
+ *   - packaged install: the installer package is downloaded and run silently;
+ *   - portable zip (runtime downloaded on demand): the zip is unpacked over the program
+ *     directory — the runtime directory, installed apps and
+ *     snapshots live in the user data directory and are untouched;
+ *   - portable build bundling the runtime: same as above, plus resources/runtime.
  *
- * 替换不能在本进程里做（exe 正被占用），所以生成一段 PowerShell 脚本，
- * 用 EncodedCommand 交给独立进程：等本进程退出 → 复制文件 → 重新拉起。
- * 用 base64 传脚本而不是写 .ps1 文件，是为了绕开「路径含中文时脚本被按 GBK 解码」
- * 这类老问题（PowerShell 5.1 读无 BOM 脚本会按 ANSI 解释）。
+ * Заменять файлы из своего процесса нельзя (они заняты), поэтому генерируется
+ * sh-скрипт: ждёт выхода процесса по pid → копирует → запускает снова.
  */
 const fs = require('fs');
 const path = require('path');
@@ -25,7 +25,7 @@ const { Sources } = require('./sources');
 const OWNER = 'RoutineMiku';
 const REPO = 'apkstart';
 
-/** PowerShell 单引号字符串：内部的 ' 要写成 '' */
+/** Строка в одинарных кавычках для sh: внутренние ' экранируются */
 function psq(s) {
   return `'${String(s).replace(/'/g, "''")}'`;
 }
@@ -43,18 +43,14 @@ class Updater {
     this.dataDir = o.dataDir;
     this.onProgress = o.onProgress || (() => {});
     this.settings = typeof o.settings === 'function' ? o.settings : () => (o.settings || {});
-    // settings() 给 sources 用：决定「走 GitHub 还是 Gitee」「有没有镜像前缀」
+    // settings() feeds sources: GitHub vs Gitee and whether a mirror prefix is set
     this.sources = new Sources(this.settings);
     this.latest = null;
     this._last = null;
   }
 
-  /** 安装形态：安装版（有卸载器）还是便携包 */
+  /** Форма установки. На Linux — только AppImage/распакованный каталог. */
   get flavor() {
-    try {
-      const un = fs.readdirSync(this.installDir).find((n) => /^Uninstall .*\.exe$/i.test(n));
-      if (un) return 'setup';
-    } catch (_) { /* ignore */ }
     return 'portable';
   }
 
@@ -63,26 +59,25 @@ class Updater {
   }
 
   /**
-   * 检查更新：GitHub / Gitee 并发问，取版本号更高的，资产取并集。
-   * 具体下载地址在 prepare() 里再做一次真实测速排序。
+   * Check for updates: ask GitHub / Gitee concurrently, keep the higher version and unite assets.
+   * Actual download URLs are speed-ranked again inside prepare().
    */
   /**
-   * @param {{force?:boolean}} [opts] force=true 时跳过 10 分钟的版本缓存
-   *        （用户主动点「检查更新」应该拿到最新结果；启动时的静默检查走缓存）
+   * @param {{force?:boolean}} [opts] force=true skips the 10-minute version cache
+   *        (a manual check should be fresh; the silent start-up check may use the cache)
    */
   async check(opts = {}) {
     const merged = await this.sources.latest({ force: !!opts.force });
     const pick = (re) => merged.assets.find((a) => re.test(String(a.name || '')));
-    // 发行版里同时挂着「便携包」和「运行时整包」（ApkStart-runtime-*.zip）。
-    // 兜底的 .zip 匹配必须把运行时整包排除掉：某次发布如果只有运行时整包、
-    // 没有便携包，旧逻辑会把它当更新包解压进程序目录（多出 1.5GB 文件、程序也被换坏）。
+    // Releases carry both the program package and the runtime bundle (ApkStart-runtime-*.zip).
+    // The .zip fallback must exclude the runtime bundle: a release with only the runtime
+    // used to be unpacked over the program (1.5 GB of files, a broken install).
     const isRuntimePack = (a) => /runtime/i.test(String((a && a.name) || ''));
 
-    const wantSetup = this.flavor === 'setup';
-    const asset = wantSetup
-      ? (pick(/Setup\.exe$/i) || merged.assets.find((a) => /\.exe$/i.test(a.name) && !isRuntimePack(a)))
-      : (pick(/portable.*\.zip$/i) || pick(/win64.*\.zip$/i)
-        || merged.assets.find((a) => /\.zip$/i.test(a.name) && !isRuntimePack(a)));
+    // Linux: берём только AppImage или linux.zip; .exe и win-архивы не наши.
+    const asset = pick(/\.AppImage$/i) || pick(/linux.*\.zip$/i)
+      || merged.assets.find((a) => /\.zip$/i.test(a.name) && !isRuntimePack(a)
+        && !/win|setup|portable/i.test(String(a.name || '')));
 
     this.latest = {
       version: merged.version,
@@ -91,14 +86,14 @@ class Updater {
       notes: merged.notes,
       htmlUrl: merged.htmlUrl,
       publishedAt: merged.publishedAt,
-      // 注意带上 parts：Gitee 的分片包没有单一 url，丢掉 parts 就变成「有资产但没地址」
+      // Keep parts: Gitee split packages have no single url, and dropping them leaves an asset without an address
       asset: asset
         ? {
           name: asset.name,
           size: asset.size,
           url: asset.url,
-          // 同名资产在 GitHub / Gitee 都有：两个地址都带着，prepare() 里测速择快。
-          // sizes 是「每个地址各自的大小」——两个源压出来的字节数并不相同。
+          // The asset exists on GitHub and Gitee: keep both URLs and let prepare() pick the faster.
+          // sizes are per URL — the two sources produce different byte counts.
           urls: asset.urls,
           sizes: asset.sizes,
           source: asset.source,
@@ -107,7 +102,7 @@ class Updater {
         }
         : null,
       assets: merged.assets,
-      // 两个源各自的最新版本 / 谁不可达，界面上可以如实显示「这次走的哪个源」
+      // Per-source latest versions and unreachable flags, so the UI can say which source was used
       sources: merged.sources,
       unreachable: merged.unreachable,
       flavor: this.flavor,
@@ -120,38 +115,38 @@ class Updater {
   }
 
   /**
-   * 下载并准备好「载荷」：便携版解压到 update/<ver>/payload，安装版直接留 Setup.exe。
+   * Download and prepare the payload: zip into update/<ver>/payload, installers kept as-is.
    * @returns {Promise<{mode:'zip'|'setup', payload:string, version:string}>}
    */
   async prepare(info) {
     const it = info || this.latest;
-    if (!it || !it.asset) throw new Error('这个版本没有可自动安装的安装包，请到 GitHub 发布页手动下载');
+    if (!it || !it.asset) throw new Error('This release has no auto-installable package — download it from the releases page');
     const dir = path.join(this.updateDir, it.version);
     fs.mkdirSync(dir, { recursive: true });
     const file = path.join(dir, it.asset.name);
     let total = it.asset.size || 0;
     const conns = Math.max(1, Math.min(16, Number((this.settings().runtime || {}).downloadConnections) || 8));
 
-    // Gitee 附件单文件上限 100MB，所以发布时会把包切成 .part1/.part2。
-    // 每个分片单独测速选源（可以一部分来自 Gitee、一部分来自 GitHub 镜像），
-    // 下完按顺序拼回整包 —— 对用户来说仍然只是「下载 + 解压」。
+    // Gitee caps attachments at 100 MB, so packages are published as .part1/.part2.
+    // Each part is speed-tested separately (some from Gitee, some from a GitHub mirror)
+    // and reassembled in order — still just a download plus an unpack for the user.
     if (it.asset.parts && it.asset.parts.length) {
       await this._downloadParts(it.asset, file, conns, total);
     } else {
-      this.onProgress({ stage: 'download', percent: 1, message: `正在下载 ${it.asset.name}…` });
-      // 候选地址 = 源站 + 镜像前缀；先各下 256KB 实测速度，再拿最快的那个分块下载。
-      // 这是「GitHub 直连几十 KB/s、镜像能跑几 MB/s」时唯一靠谱的选路方式：
-      // 按域名猜没用，同一天不同时段差别很大。
+      this.onProgress({ stage: 'download', percent: 1, message: `Downloading ${it.asset.name}…` });
+      // Candidates = origin + mirror prefix; probe 256 KB each, then chunk-download from the fastest.
+      // This is the only reliable choice when direct GitHub runs at tens of KB/s and a mirror at MB/s:
+      // guessing by domain fails because speeds vary through the day.
       const cands = this.sources.candidates(it.asset);
       const ranked = await this.sources.rank(cands, { onProgress: (p) => this.onProgress(p) }).catch(() => cands);
-      // 进度用的总大小要取「真正在下那个源」的：GitHub 与 Gitee 的包不是同一份字节
-      // （压缩器不同，能差好几 MB），拿错就会一直显示 92% 再突然跳到完成。
+      // Progress uses the total size of the source actually downloading: GitHub and Gitee differ
+      // by several MB, and the wrong total sticks at 92% before jumping to done.
       const sizes = it.asset.sizes || {};
       for (const u of ranked) {
         if (sizes[u]) { total = sizes[u]; break; }
       }
-      // downloadMulti：分块同时从「GitHub 直连」和「镜像」拉，带宽叠加；
-      // 只有一个源可用或对方不支持 Range 时，它自己退回单源分块。
+      // downloadMulti pulls chunks from direct GitHub and mirrors at once to add bandwidth;
+      // With a single source or no Range support, it falls back to single-source chunking.
       await downloadMulti(ranked, file, {
         connections: conns,
         onProgress: (pr) => {
@@ -161,7 +156,7 @@ class Updater {
           this.onProgress({
             stage: 'download',
             percent: Math.max(1, Math.min(99, pct)),
-            message: `下载中 ${mb}${sp}`,
+            message: `Downloading ${mb}${sp}`,
             speed: pr.speed,
           });
         },
@@ -173,15 +168,15 @@ class Updater {
       fs.rmSync(out, { recursive: true, force: true });
       fs.mkdirSync(out, { recursive: true });
       await this._extract(file, out);
-      this.onProgress({ stage: 'ready', percent: 100, message: '更新包已解压完成' });
+      this.onProgress({ stage: 'ready', percent: 100, message: 'Update unpacked' });
       return { mode: 'zip', payload: out, version: it.version };
     }
-    this.onProgress({ stage: 'ready', percent: 100, message: '安装包已下载完成' });
+    this.onProgress({ stage: 'ready', percent: 100, message: 'Package downloaded' });
     return { mode: 'setup', payload: file, version: it.version };
   }
 
   /**
-   * 下载并拼装分片包。
+   * Download and reassemble a split package.
    * @param {{name:string, size:number, parts:Array<{index:number,size:number,urls:string[]}>}} asset
    */
   async _downloadParts(asset, target, conns, total) {
@@ -209,15 +204,15 @@ class Updater {
             this.onProgress({
               stage: 'download',
               percent: Math.max(1, Math.min(99, pct)),
-              message: `下载中 ${(got / 1048576).toFixed(1)} MB${total ? ` / ${(total / 1048576).toFixed(1)} MB` : ''}`
-                + `（第 ${part.index}/${asset.parts.length} 片）${sp}`,
+              message: `Downloading ${(got / 1048576).toFixed(1)} MB${total ? ` / ${(total / 1048576).toFixed(1)} MB` : ''}`
+                + ` (part ${part.index}/${asset.parts.length})${sp}`,
               speed: pr.speed,
             });
           },
         });
         const buf = fs.readFileSync(tmp);
         if (part.size && buf.length !== part.size) {
-          throw new Error(`分片 ${part.index} 大小不对（${buf.length} ≠ ${part.size}），已中止，可重试`);
+          throw new Error(`Part ${part.index} has the wrong size (${buf.length} != ${part.size}); aborted, retry`);
         }
         fs.writeSync(fd, buf, 0, buf.length, doneBytes);
         doneBytes += buf.length;
@@ -227,7 +222,7 @@ class Updater {
       fs.closeSync(fd);
     }
     if (total && doneBytes !== total) {
-      throw new Error(`更新包拼装后大小不对（${doneBytes} ≠ ${total}），已中止，可重试`);
+      throw new Error(`Reassembled package has the wrong size (${doneBytes} != ${total}); aborted, retry`);
     }
   }
 
@@ -239,14 +234,14 @@ class Updater {
       for (const n of names) {
         i += 1;
         const target = path.join(dest, n.replace(/\\/g, '/'));
-        if (!target.startsWith(path.resolve(dest))) continue;   // 防 zip-slip
+        if (!target.startsWith(path.resolve(dest))) continue;   // zip-slip guard
         fs.mkdirSync(path.dirname(target), { recursive: true });
         await zf.pipeTo(n, fs.createWriteStream(target));
         if (i % 20 === 0) {
           this.onProgress({
             stage: 'extract',
             percent: Math.min(99, Math.round((i / names.length) * 100)),
-            message: `正在解压 ${i}/${names.length}`,
+            message: `Extracting ${i}/${names.length}`,
           });
         }
       }
@@ -256,11 +251,12 @@ class Updater {
   }
 
   /**
-   * 生成并启动「替换 + 重启」脚本，然后调用方负责退出应用。
+   * Generate and start the replace-and-restart script; the caller quits the app.
    * @param {{mode:'zip'|'setup', payload:string, version:string}} job
-   * @param {{waitPid?:number, spawn?:boolean}} [opts] 测试时可指定别的 pid / 不真启动
+   * @param {{waitPid?:number, spawn?:boolean}} [opts] tests may pass another pid / not spawn
    */
   apply(job, opts = {}) {
+    if (process.platform === 'linux') return this._applyLinux(job, opts);
     const exe = this.exePath;
     const dir = this.installDir;
     const logFile = path.join(this.updateDir, 'update.log');
@@ -272,7 +268,7 @@ class Updater {
       `$log = ${psq(logFile)}`,
       `function Note($m) { Add-Content -Path $log -Value ("[{0}] {1}" -f (Get-Date -Format 'HH:mm:ss'), $m) }`,
       `Note 'updater start'`,
-      // 等本进程真正退出（最多 90 秒），否则 exe/dll 仍被占用
+      // Wait for this process to really exit (90 s max), otherwise files stay locked
       `try { Wait-Process -Id ${waitPid} -Timeout 90 } catch { }`,
       `Start-Sleep -Milliseconds 700`,
     ];
@@ -289,8 +285,8 @@ class Updater {
         `  Note "copy pass $i failed, retry"; Start-Sleep -Milliseconds 600`,
         `}`,
         `if (-not $ok) { Note 'copy failed' }`,
-        // 新版本里已经删掉的文件不会因为覆盖而消失，但保留它们无害；
-        // 只清掉本次的解压目录，避免白占几百 MB。
+        // Files removed in the new version are not deleted by a plain copy, which is harmless;
+        // only this run's extract directory is cleaned so it does not waste hundreds of MB.
         `Remove-Item -Path $src -Recurse -Force`,
       );
     } else {
@@ -307,20 +303,20 @@ class Updater {
       `Note 'updater done'`,
       `Start-Sleep -Milliseconds 400`,
       `Remove-Item -Path ${psq(path.join(this.updateDir, job.version))} -Recurse -Force`,
-      // 收尾的清理语句失败（目录已被删/被杀软占用）不应该让调用方以为更新失败
+      // A failing cleanup must not make the caller think the update failed
       `exit 0`,
     );
 
     const script = lines.join('\r\n');
     fs.writeFileSync(path.join(this.updateDir, 'apply.log.ps1'), script, 'utf8');
     if (opts.spawn === false) return script;
-    // -EncodedCommand 走 UTF-16LE base64：脚本里出现中文路径也不会被 GBK 解码搞坏
+    // -EncodedCommand uses UTF-16LE base64 so non-ASCII paths survive any console code page
     const b64 = Buffer.from(script, 'utf16le').toString('base64');
     const ps = path.join(process.env.SystemRoot || 'C:\\Windows', 'System32', 'WindowsPowerShell', 'v1.0', 'powershell.exe');
-    // 这里**不能**用 detached：某些安全软件 / 沙箱策略会直接拦掉「分离的控制台进程」，
-    // 表现为脚本一声不响地根本没跑（更新界面卡在「正在替换程序并重启」）。
-    // Windows 上父进程退出并不会杀掉普通子进程，所以用「普通子进程 + unref」同样能在
-    // 我们退出之后继续干活，兼容性还更好。
+    // detached must NOT be used here: some security tools / sandbox policies block detached consoles,
+    // leaving the script never started (the update UI sticks on 'replacing and restarting').
+    // A normal child plus unref survives the parent exit just as well,
+    // and is more compatible.
     const child = spawn(ps, [
       '-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass',
       '-WindowStyle', 'Hidden', '-EncodedCommand', b64,
@@ -329,7 +325,60 @@ class Updater {
     return true;
   }
 
-  /** 打不开 UI 的场景（或没有可自动安装的资产）时，把发布页丢给浏览器 */
+  /**
+   * Linux: заменяем файлы и перезапускаем через bash-скрипт.
+   * Ждём выхода процесса по pid, копируем каталог (или подменяем AppImage),
+   * затем запускаем заново. Пишем в лог, чтобы сбой обновления было видно.
+   */
+  _applyLinux(job, opts = {}) {
+    const { execFile } = require('child_process');
+    const dir = this.installDir;
+    const exe = this.exePath;
+    const logFile = path.join(this.updateDir, 'update.log');
+    fs.mkdirSync(this.updateDir, { recursive: true });
+    const waitPid = opts.waitPid || process.pid;
+    const q = (s) => `'${String(s).replace(/'/g, "'\\''")}'`;
+
+    const lines = [
+      '#!/bin/sh',
+      `LOG=${q(logFile)}`,
+      'note() { printf "[%s] %s\n" "$(date +%H:%M:%S)" "$1" >> "$LOG"; }',
+      "note 'updater start'",
+      `for i in $(seq 1 90); do kill -0 ${waitPid} 2>/dev/null || break; sleep 1; done`,
+      'sleep 1',
+    ];
+    if (job.mode === 'zip') {
+      lines.push(
+        `SRC=${q(job.payload)}`,
+        `DST=${q(dir)}`,
+        'cp -a "$SRC"/. "$DST"/ 2>>"$LOG" || note "copy failed"',
+        'rm -rf "$SRC"',
+      );
+    } else {
+      // AppImage: payload — новый файл, подменяем на месте
+      lines.push(
+        `NEW=${q(job.payload)}`,
+        `cp -f "$NEW" ${q(exe)} 2>>"$LOG" || note "replace failed"`,
+        `chmod +x ${q(exe)}`,
+      );
+    }
+    lines.push(
+      `if [ -x ${q(exe)} ]; then nohup ${q(exe)} >/dev/null 2>&1 & note relaunched; fi`,
+      "note 'updater done'",
+      'exit 0',
+    );
+
+    const script = lines.join('\n') + '\n';
+    const scriptPath = path.join(this.updateDir, 'apply.sh');
+    fs.writeFileSync(scriptPath, script, 'utf8');
+    fs.chmodSync(scriptPath, 0o755);
+    if (opts.spawn === false) return script;
+    const child = execFile('/bin/sh', [scriptPath], { detached: true, stdio: 'ignore' });
+    child.unref();
+    return true;
+  }
+
+  /** When the UI cannot open (or no auto-installable asset exists), open the releases page */
   static repoUrl() {
     return `https://github.com/${OWNER}/${REPO}/releases`;
   }

@@ -1,7 +1,7 @@
 'use strict';
 /**
- * 安装 / 启动 / 卸载 编排层
- * 把「解析 APK → 安装进运行时 → 落本地元数据 → 生成桌面快捷方式」串成一条流水线。
+ * Install / launch / uninstall orchestration layer
+ * Chains parse APK → install into the runtime → persist metadata → create .desktop entries.
  */
 const fs = require('fs');
 const os = require('os');
@@ -10,19 +10,21 @@ const crypto = require('crypto');
 const store = require('./store');
 const { parseApk } = require('./apk');
 const { ZipFile } = require('./zip');
-const { iconToIco, writeShortcut, removeShortcut, safeFileName } = require('./shortcut');
+const {
+  installIcon, writeDesktopFile, desktopEntry, removeShortcut, safeFileName, xdgDirs,
+} = require('./shortcut');
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
-/** APK 只有 ARM 原生库（国产 App 绝大多数如此） */
+/** The APK ships ARM native libs only (true of most apps) */
 function isArmOnly(meta) {
   return !!(meta && meta.abis && meta.abis.length && !meta.abis.some((a) => /x86/i.test(a)));
 }
 
 /**
- * 拆分安装包（.apks / .xapk）：解出里面的分片 APK 到纯 ASCII 临时目录。
- * 用文件版 ZIP 读取器 + 流式落盘：拆分包动辄 2GB+，整包读内存会失败。
- * 返回 { meta, files, cleanup }；meta 来自带 AndroidManifest 的 base APK。
+ * Split packages (.apks / .xapk): extract the split APKs into an ASCII-only temp directory.
+ * Uses the file-based ZIP reader and streams to disk: bundles reach 2 GB+ and do not fit in RAM.
+ * Returns { meta, files, cleanup }; meta comes from the base APK carrying AndroidManifest.
  */
 async function parseBundle(filePath) {
   const zip = new ZipFile(filePath);
@@ -31,21 +33,21 @@ async function parseBundle(filePath) {
   const cleanup = () => { try { fs.rmSync(dir, { recursive: true, force: true }); } catch (_) { /* ignore */ } };
   try {
     const apkNames = zip.names().filter((n) => /\.apk$/i.test(n));
-    if (!apkNames.length) throw new Error('这个安装包里没有找到 APK 分片（可能不是 .apks/.xapk）');
+    if (!apkNames.length) throw new Error('No APK splits found in this bundle (not a .apks/.xapk?)');
     fs.mkdirSync(dir, { recursive: true });
     const files = [];
     for (let i = 0; i < apkNames.length; i++) {
       const target = path.join(dir, `split-${i}.apk`);
-      // 单个分片也可能是几百 MB：流式解压，不经过 Buffer
+      // A single split can be hundreds of MB: stream it, never through a Buffer
       // eslint-disable-next-line no-await-in-loop
       await zip.pipeTo(apkNames[i], fs.createWriteStream(target));
       files.push(target);
     }
     let meta = null;
     for (const f of files) {
-      try { meta = parseApk(f); break; } catch (_) { /* 分片里没有清单 */ }
+      try { meta = parseApk(f); break; } catch (_) { /* no manifest in this split */ }
     }
-    if (!meta) throw new Error('拆分包的 base APK 解析失败');
+    if (!meta) throw new Error('Failed to parse the bundle base APK');
     return { meta, files, cleanup };
   } catch (e) {
     cleanup();
@@ -75,46 +77,57 @@ class Installer {
 
   iconFile(pkg) { return store.iconPath(pkg); }
 
-  icoFile(pkg) { return path.join(store.ICON_DIR, `${pkg}.ico`); }
+  /** Имя файла .desktop для приложения (без пробелов, стабильно между установками) */
+  desktopFileName(app) { return `${app.package}.desktop`; }
 
   shortcutPath(app) {
     const s = store.getSettings();
     const dir = s.shortcutDir && s.shortcutDir.trim() ? s.shortcutDir : this.ctx.desktopDir;
-    return path.join(dir, `${safeFileName(app.label)}.lnk`);
+    return path.join(dir, this.desktopFileName(app));
   }
 
   /**
-   * 桌面 + 开始菜单两份。
-   * Windows 搜索索引的是「开始菜单 \ 程序」里的 .lnk，只放桌面会搜不到；
-   * 有些机器的桌面被 OneDrive 重定向，开始菜单这份也保证入口不丢。
+   * Ярлык на рабочем столе + запись в меню приложений.
+   * В меню (~/.local/share/applications) приложение находится через поиск GNOME/KDE,
+   * поэтому в отличие от Windows «Старт» здесь ставим тот же файл, но с именем пакета:
+   * так две программы с одинаковым названием не затирают друг друга.
    */
   shortcutPaths(app) {
     const out = [this.shortcutPath(app)];
-    if (this.ctx.startMenuDir && store.getSettings().createStartMenuShortcut !== false) {
-      // 放在独立子目录：既能被 Windows 搜索索引到，又不会覆盖同名第三方应用的快捷方式
-      // （实测「红果免费短剧」在开始菜单里已被另一个桌面助手占用）
-      out.push(path.join(this.ctx.startMenuDir, 'ApkStart', `${safeFileName(app.label)}.lnk`));
+    if (this.ctx.applicationsDir && store.getSettings().createStartMenuShortcut !== false) {
+      out.push(path.join(this.ctx.applicationsDir, this.desktopFileName(app)));
     }
     return [...new Set(out)];
   }
 
-  /** 兼容镜像按「首次遇到 ARM 应用」按需下载，作为共享只读基础层只下一次 */
+  /** Имя иконки для .desktop: раскладываем PNG из APK в hicolor, иначе берём путь к PNG */
+  prepareIconImage(app) {
+    const src = app.iconPath && fs.existsSync(app.iconPath) ? app.iconPath : null;
+    if (!src) return null;
+    try {
+      return installIcon(fs.readFileSync(src), `apkstart-${app.package}`) || src;
+    } catch (_) {
+      return src;
+    }
+  }
+
+  /** Download the compatible image on the first ARM app; a shared read-only layer fetched once */
   async ensureCompatImage(onProgress) {
     const prov = this.runtime.provisioner;
     if (prov.playImageInfo().ok) return true;
-    onProgress({ stage: 'runtime', message: '首次安装 ARM 应用：正在下载兼容镜像（约 1.5GB，只需一次）…' });
+    onProgress({ stage: 'runtime', message: 'First ARM app: downloading the compatible image (~1.5 GB, once)…' });
     await prov.installPlayImage((p) => onProgress({ stage: 'runtime', message: p.message, percent: p.percent }));
-    if (!prov.playImageInfo().ok) throw new Error('兼容镜像下载失败，请检查网络后重试');
+    if (!prov.playImageInfo().ok) throw new Error('Compatible image download failed — check the network and retry');
     return true;
   }
 
-  /** 切换镜像必须重启运行时；重启后把已装应用从本地 APK 备份重新灌回去 */
+  /** Switching the image restarts the runtime; installed apps are restored from local APK backups */
   async switchToCompat(onProgress) {
     const apps = store.getApps();
     store.saveSettings({ runtime: { compatImage: true } });
-    onProgress({ stage: 'runtime', message: '正在切换到兼容镜像并重启运行时…' });
+    onProgress({ stage: 'runtime', message: 'Switching to the compatible image and restarting the runtime…' });
     try { await this.runtime.stop(); } catch (_) { /* ignore */ }
-    // 等旧设备从 adb 列表里消失，避免被 ensure() 当成可复用实例
+    // Wait until the old device leaves the adb list so ensure() does not reuse it
     for (let i = 0; i < 12; i += 1) {
       // eslint-disable-next-line no-await-in-loop
       const ds = await this.runtime.client().devices().catch(() => []);
@@ -124,7 +137,7 @@ class Installer {
     }
     const rt = await this.runtime.ensure({ onLog: (m) => onProgress({ stage: 'runtime', message: m }) });
     if (!rt.ok) {
-      const err = new Error(rt.error || '切换兼容镜像后运行时不可用');
+      const err = new Error(rt.error || 'Runtime unavailable after switching the compatible image');
       err.needsSetup = rt.needsSetup || 'provision';
       throw err;
     }
@@ -141,14 +154,14 @@ class Installer {
           // eslint-disable-next-line no-await-in-loop
           await rt.client.install(app.apkPath);
         }
-        onProgress({ stage: 'runtime', message: `正在恢复已装应用 ${app.label}…` });
-      } catch (_) { /* 单个应用恢复失败不阻塞 */ }
+        onProgress({ stage: 'runtime', message: `Restoring ${app.label}…` });
+      } catch (_) { /* a single failed restore does not block */ }
     }
     return rt;
   }
 
   async install(filePath, onProgress = () => {}) {
-    onProgress({ stage: 'parse', message: '正在解析 APK…' });
+    onProgress({ stage: 'parse', message: 'Parsing the APK…' });
     let meta;
     let bundle = null;
     if (/\.(apks|xapk)$/i.test(filePath)) {
@@ -159,22 +172,22 @@ class Installer {
     }
     onProgress({
       stage: 'parse-done',
-      message: `已识别 ${meta.label}（${meta.package}）`,
+      message: `Recognised ${meta.label} (${meta.package})`,
       meta: { label: meta.label, package: meta.package, versionName: meta.versionName },
     });
 
     try {
-      // 零配置：仅含 ARM 库的应用自动补齐带 ARM 翻译层的镜像，用户不用开任何开关
+      // Zero-config: ARM-only apps automatically get the image with the ARM translation layer
       if (isArmOnly(meta) && !this.runtime.provisioner.playImageInfo().ok) {
         await this.ensureCompatImage(onProgress);
         const switched = await this.switchToCompat(onProgress);
         return this.finishInstall(switched, meta, filePath, bundle, onProgress);
       }
 
-      onProgress({ stage: 'runtime', message: '正在准备安卓运行时…' });
+      onProgress({ stage: 'runtime', message: 'Preparing the Android runtime…' });
       const rt = await this.runtime.ensure({ onLog: (m) => onProgress({ stage: 'runtime', message: m }) });
       if (!rt.ok) {
-        const err = new Error(rt.error || '运行时不可用');
+        const err = new Error(rt.error || 'Runtime unavailable');
         err.needsSetup = rt.needsSetup || 'provision';
         throw err;
       }
@@ -184,22 +197,22 @@ class Installer {
     }
   }
 
-  /** 安装本体 + 落盘元数据 + 快捷方式；失败时带一次自动修复重试 */
+  /** Install, persist metadata and create shortcuts; one automatic repair retry on failure */
   async finishInstall(rt, meta, filePath, bundle, onProgress) {
     const client = rt.client;
     const existing = store.getApp(meta.package);
-    // 装完之后旧 quickboot 快照里的磁盘状态就过期了，留着会导致「装好的应用重启后又不见了」
+    // After install the old quickboot snapshot is stale and would hide the new app after a restart
     try { this.runtime.emulator?.invalidateSnapshot(); } catch (_) { /* ignore */ }
-    onProgress({ stage: 'install', message: existing ? '正在更新应用…' : '正在安装应用…' });
+    onProgress({ stage: 'install', message: existing ? 'Updating the app…' : 'Installing the app…' });
     try {
       if (bundle) await client.installMultiple(bundle.files);
       else await client.install(filePath);
     } catch (e) {
-      // 到了这一步还报 ABI 不匹配：说明当前运行时是 AOSP 镜像，自动切兼容镜像再装一次
+      // An ABI mismatch here means an AOSP image: switch to the compatible one and retry
       if (e.code === 'NO_MATCHING_ABIS' && !this.runtime.provisioner.playImageInfo().ok) {
         await this.ensureCompatImage(onProgress);
         const rt2 = await this.switchToCompat(onProgress);
-        onProgress({ stage: 'install', message: '已切换兼容镜像，正在重新安装…' });
+        onProgress({ stage: 'install', message: 'Switched to the compatible image, reinstalling…' });
         if (bundle) await rt2.client.installMultiple(bundle.files);
         else await rt2.client.install(filePath);
       } else {
@@ -208,45 +221,51 @@ class Installer {
     }
     this.runtime.touch();
 
-    // 图标落盘。APK 图标大量是 WebP，nativeImage 解不了，交给渲染进程解码 +
-    // 品牌占位图兜底，保证 .lnk 一定带图标（之前 icoPath 一直是 null）。
-    // iconFallback 记录「真实图标解不出来、用了占位图」——这种要作为软警告告诉用户，
-    // 否则桌面上只有一片绿色三角，用户会以为是 ApkStart 弄错了图标。
+    // Иконка на диск: PNG кладём как есть, WebP декодирует рендерер
+    // (nativeImage WebP не умеет). На Linux обходится без ICO — достаточно PNG
+    // в hicolor, но если и его получить не удалось, ставим брендовый placeholder.
     let iconPath = null;
-    let icoPath = null;
+    let iconMime = 'image/png';
     let iconFallback = '';
     if (meta.iconPng) {
       try {
         iconPath = store.iconPath(meta.package);
         fs.writeFileSync(iconPath, meta.iconPng);
+        iconMime = /^\xFF\xD8/.test(meta.iconPng.toString('latin1', 0, 2)) ? 'image/jpeg' : 'image/png';
       } catch (_) { /* ignore */ }
-      try {
-        const ico = await iconToIco(meta.iconPng, {
-          decode: this.ctx.decodeIcon,
-          onFallback: (why) => { iconFallback = why; },
-        });
-        if (ico) {
-          icoPath = this.icoFile(meta.package);
-          fs.writeFileSync(icoPath, ico);
-        }
-      } catch (_) { /* 图标失败不影响安装 */ }
+      if (iconMime !== 'image/png') {
+        try {
+          if (typeof this.ctx.decodeIcon === 'function') {
+            const png = await this.ctx.decodeIcon(meta.iconPng);
+            if (Buffer.isBuffer(png) && png.length) {
+              iconPath = store.iconPath(meta.package);
+              fs.writeFileSync(iconPath, png);
+              iconMime = 'image/png';
+            } else {
+              iconFallback = 'decode-output-invalid';
+            }
+          } else {
+            iconFallback = 'no-decoder';
+          }
+        } catch (_) { iconFallback = 'webp-decode-failed'; }
+      }
     }
 
-    // 备份 APK，便于日后重装/找回
+    // Keep a copy of the APK for reinstall/recovery
     let apkCopy = null;
     try {
       apkCopy = store.apkPath(meta.package, meta.versionCode.toString(36));
       fs.copyFileSync(filePath, apkCopy);
     } catch (_) { /* ignore */ }
 
-    // 启动入口以系统解析结果为准：APK 里解析到的「主 Activity」经常不是
-    // 真正的 LAUNCHER 入口，直接用它启动会跳过应用的初始化页导致闪退。
+    // Trust the system's resolution: the 'main activity' parsed from the APK is often not
+    // the real LAUNCHER entry, and starting it skips app init and crashes.
     let launchActivity = meta.launchActivity;
     try {
       client.clearLauncherCache?.(meta.package);
       const resolved = await client.resolveLauncher(meta.package);
       if (resolved) launchActivity = resolved;
-    } catch (_) { /* 保留 APK 解析结果 */ }
+    } catch (_) { /* keep the parsed result */ }
 
     const app = {
       package: meta.package,
@@ -258,7 +277,7 @@ class Installer {
       minSdk: meta.minSdk,
       sizeBytes: meta.sizeBytes,
       iconPath,
-      icoPath,
+      iconMime,
       apkPath: apkCopy,
       bundle: !!bundle,
       accent: existing ? existing.accent : accentOf(meta.package),
@@ -275,88 +294,106 @@ class Installer {
 
     const settings = store.getSettings();
     if (settings.createShortcutOnInstall) {
-      onProgress({ stage: 'shortcut', message: '正在创建桌面快捷方式…' });
+      onProgress({ stage: 'shortcut', message: 'Creating the desktop shortcut…' });
       try {
         app.shortcutPath = this.createShortcut(app);
         store.upsertApp({ package: app.package, shortcutPath: app.shortcutPath });
       } catch (e) {
-        onProgress({ stage: 'shortcut-warn', message: `快捷方式创建失败：${e.message}` });
+        onProgress({ stage: 'shortcut-warn', message: `Shortcut creation failed: ${e.message}` });
       }
     }
 
-    // 兼容性提示：只有 ARM 原生库时，x86 运行时需要转译层
+    // Compatibility hints: ARM-only apps need the translation layer on an x86 runtime
     const warnings = [];
     if (meta.minSdk && meta.minSdk > 34) {
-      warnings.push(`此应用要求 Android ${meta.minSdk}+，高于当前运行时，可能无法正常运行。`);
+      warnings.push(`This app needs Android ${meta.minSdk}+, newer than the current runtime; it may not run.`);
     }
     if (iconFallback === 'placeholder') {
-      warnings.push('应用图标无法解析（可能是特殊格式的自适应图标），快捷方式暂时使用占位图标。');
+      warnings.push('The app icon could not be parsed (unusual adaptive icon); the shortcut uses a placeholder.');
     } else if (iconFallback === 'webp-decode-failed') {
-      warnings.push('应用图标（WebP）解码失败，快捷方式暂时使用占位图标。');
+      warnings.push('The WebP app icon failed to decode; the shortcut uses a placeholder.');
     }
     client.batteryOptimizeOff(meta.package).catch(() => {});
-    // 装应用时作废了旧快照，这里补排一次：空闲时把「已装好新应用」的状态存下来，
-    // 否则下次开机要重新冷启动（20 多秒）。
+    // Installing voided the old snapshot; schedule a new one so the installed state is saved
+    // while idle — otherwise the next start is a 20-second cold boot.
     try { this.runtime.scheduleSnapshotSave?.(12000); } catch (_) { /* ignore */ }
 
-    onProgress({ stage: 'done', message: `${app.label} 安装完成`, app });
+    onProgress({ stage: 'done', message: `${app.label} installed`, app });
     return { app, warnings, engine: rt.engine };
   }
 
   createShortcut(app) {
     const { target, baseArgs } = this.shortcutTarget();
-    const args = `${baseArgs ? baseArgs + ' ' : ''}--launch "${app.package}"`.trim();
-    const ico = app.icoPath && fs.existsSync(app.icoPath) ? app.icoPath : undefined;
+    const icon = this.prepareIconImage(app);
     const paths = this.shortcutPaths(app);
 
-    const write = (shortcutPath) => writeShortcut({
-      shortcutPath,
-      target,
-      args,
-      iconIcoPath: ico,
-      description: `${app.label} — 由 ApkStart 运行`,
-      cwd: this.ctx.cwd,
-      // 每个应用一个 AUMID：任务栏上按应用分组，不会全挤到 ApkStart 里
-      appUserModelId: `RoutineMiku.ApkStart.${app.package}`.slice(0, 128),
+    const content = (name) => desktopEntry({
+      name,
+      comment: `${app.label} — запускается через ApkStart`,
+      exec: target,
+      args: [...(baseArgs ? [baseArgs] : []), '--launch', app.package],
+      icon: icon || undefined,
+      categories: 'Utility;',
+      // отдельная WM_CLASS на приложение: DE группирует окна и подхватывает иконку
+      startupWMClass: `apkstart-${app.package}`,
     });
 
     let first = null;
-    let startMenuPath = null;
+    let menuPath = null;
     const errors = [];
     paths.forEach((p, i) => {
       try {
-        write(p);
+        writeDesktopFile(p, content(app.label));
         if (!first) first = p;
-        if (i === 1) startMenuPath = p;
+        if (i === 1) menuPath = p;
       } catch (e) {
         errors.push(`${p}: ${e.message}`);
       }
     });
 
-    // 主路径全失败（自定义快捷方式目录不可写 / 被安全软件拦截）：
-    // 退回桌面再试一次——桌面上有图标，用户才找得到应用。
+    // Если оба каталога не пишутся (read-only home, странный sandbox) —
+    // последняя попытка кладём файл прямо на рабочий стол.
     if (!first) {
-      const fallback = path.join(this.ctx.desktopDir, `${safeFileName(app.label)}.lnk`);
+      const fallback = path.join(this.ctx.desktopDir, this.desktopFileName(app));
       try {
-        write(fallback);
+        writeDesktopFile(fallback, content(app.label));
         first = fallback;
       } catch (e) {
         errors.push(`${fallback}: ${e.message}`);
       }
     }
-    if (!first) throw new Error(errors.join('; ') || '创建快捷方式失败');
-    // 开始菜单那份的路径也存下来，卸载时一起删
-    if (startMenuPath || first) {
-      store.upsertApp({ package: app.package, startMenuPath });
-    }
+    if (!first) throw new Error(errors.join('; ') || 'не удалось создать .desktop');
+    if (menuPath) store.upsertApp({ package: app.package, startMenuPath: menuPath });
     return first;
   }
 
-  /** 补全缺失的快捷方式与图标：老版本只建了桌面那份，且 WebP 图标当时没转成功 */
+  /** Дописать отсутствующие ярлыки и иконки (старые установки, удалённые файлы) */
   async ensureShortcuts() {
     const made = [];
-    // 用户明确关掉「安装后自动创建」、且这个应用本来就没有任何入口时不要擅自补，
-    // 否则开关关掉了也挡不住启动时被重建。
+    const auto = store.getSettings().createShortcutOnInstall !== false;
+    for (const app of store.getApps()) {
+      if (!auto && !app.shortcutPath && !app.startMenuPath) continue;
+      let dirty = false;
+      if ((!app.iconPath || !fs.existsSync(app.iconPath)) && fs.existsSync(store.iconPath(app.package))) {
+        app.iconPath = store.iconPath(app.package);
+        dirty = true;
+      }
+      const missing = this.shortcutPaths(app).filter((p) => !fs.existsSync(p));
+      if (!missing.length && !dirty) continue;
+      try {
+        const madePath = this.createShortcut(app);
+        store.upsertApp({ package: app.package, shortcutPath: madePath, iconPath: app.iconPath });
+        made.push(app.label);
+      } catch (_) { /* один сбой не блокирует запуск */ }
+    }
+    return made;
+  }
+
+  /** Fill in missing shortcuts and icons from updates made before Linux support */
+  async ensureShortcuts() {
+    const made = [];
+    // Do not recreate entries when the user disabled auto-create and the app has none,
+    // otherwise the switch would be ignored on every start.
     const auto = store.getSettings().createShortcutOnInstall !== false;
     for (const app of store.getApps()) {
       if (!auto && !app.shortcutPath && !app.startMenuPath) continue;
@@ -371,16 +408,16 @@ class Installer {
             app.icoPath = p;
             dirty = true;
           }
-        } catch (_) { /* 图标补建失败不影响入口 */ }
+        } catch (_) { /* icon rebuild failure does not block the entry */ }
       }
       const missing = this.shortcutPaths(app).filter((p) => !fs.existsSync(p));
       if (!missing.length && !dirty) continue;
       try {
-        // 图标刚补出来时，即使 .lnk 存在也要重建，让快捷方式换上真实应用图标
+        // Rebuild even if the .desktop exists so the real icon is picked up
         const madePath = this.createShortcut(app);
         store.upsertApp({ package: app.package, shortcutPath: madePath });
         made.push(app.label);
-      } catch (_) { /* 单个失败不阻塞启动 */ }
+      } catch (_) { /* one failure does not block start-up */ }
     }
     return made;
   }
@@ -407,31 +444,31 @@ class Installer {
     const rt = await this.runtime.ensure({ onLog });
     onMark('ensure done');
     if (!rt.ok) {
-      const err = new Error(rt.error || '运行时不可用');
+      const err = new Error(rt.error || 'Runtime unavailable');
       err.needsSetup = rt.needsSetup;
       throw err;
     }
-    // 分辨率要在拉起应用之前改，避免 wm size 触发配置变更把刚启动的 Activity 重建
-    if (beforeStart) await beforeStart(rt).catch((e) => onLog(`显示适配跳过：${e.message}`));
-    // 清掉旧版本可能残留在 /data 里的 wm size / density 覆盖与自动旋转设置。
-    // 这些覆盖是持久化的，不清理的话每次启动画面都会被转 90° 躺倒、留黑边、
-    // 鼠标点击也无法对应（用户反馈的「旋转黑边 / 未填满 / 点不动同意」）。
+    // Set the resolution before launching so a config change does not recreate the activity
+    if (beforeStart) await beforeStart(rt).catch((e) => onLog(`Display fit skipped: ${e.message}`));
+    // Clear wm size / density overrides and auto-rotate left in /data by older versions.
+    // They persist, so without cleanup every launch shows a 90° rotated picture with black bars
+    // and taps miss ('rotated / not filling / cannot tap Accept').
     await rt.client.resetDisplayOverrides(!!(store.getSettings().display || {}).landscape).catch(() => {});
-    // 冷启动时顺手做过网络体检：没网就直接说清楚。否则用户只会看到「这个应用一直黑屏」，
-    // 完全想不到是虚拟机没网（联网页面拿不到数据就是一块黑底）。
-    // 关键修复：Wi-Fi 关联往往比 sys.boot_completed 晚几十秒，红果一进去就拉首页数据，
-    // 没网时首页渲染成整块黑底 —— 这就是「点同意并继续后一直黑屏」的真正原因。
-    // 所以拉起应用前先等网络就绪（最多 90 秒），宁可多等几秒也不要给用户一块黑屏。
-    // 拉起来之前先看一眼网络：**只等，不重启**。
-    // 之前这里调的是 ensureNetwork()，网络慢时会「停掉虚拟机 → 冷启动」，
-    // 结果 adb 设备在安装途中消失，直接变成「红果打不开」。
-    // 启动路径上绝不能做这种破坏性动作，等不到就先启动，大不了页面暂时加载慢。
+    // Check the network on a cold boot and say so plainly; otherwise the user just sees a black screen
+    // and never guesses the VM has no network (a page without data is a black rectangle).
+    // Key fix: Wi-Fi association often lags sys.boot_completed by tens of seconds; apps fetch
+    // their home feed immediately, and with no network it renders black — the real cause of
+    // 'black screen after Accept'. So wait for the network (up to 90 s) before launching.
+    // Look at the network first: wait only, never restart.
+    // This used to call ensureNetwork(), which on a slow network stopped the VM and cold-booted,
+    // making the adb device vanish mid-install ('the app will not open').
+    // The launch path must never do that; if waiting fails, launch anyway.
     if (rt.engine === 'emulator' || rt.engine === 'builtin') {
       const net = await this.runtime.waitForNetwork({ onLog, timeoutMs: 20000 }).catch(() => null);
       if (net && net.ok) {
-        onLog(`虚拟机网络就绪（${net.ip || ''}）`);
+        onLog(`VM network ready (${net.ip || ''})`);
       } else {
-        onLog('虚拟机网络还没就绪，先启动应用（联网页面可能稍后才加载出来）');
+        onLog('VM network not ready yet — launching anyway (online pages may load later)');
       }
     }
     const settings = store.getSettings();
@@ -439,31 +476,31 @@ class Installer {
       freeform: settings.freeform,
       bounds: app ? app.bounds : null,
     });
-    // 应用可能还没装进当前运行时（镜像重建 / 清过数据 / 首次），直接拉起会报
-    // "Invalid packageName"。先在本地缓存里把它装上再启动，这样「点开应用」永远能进，
-    // 不用先手动装一遍——这正是「点击已安装应用直接进入系统」想要的体验。
+    // The app may be missing from this runtime (image rebuilt / data cleared / first run); launching
+    // would report "Invalid packageName". Install from the local backup first so opening always works,
+    // which is the expected 'click the installed app and it opens' experience.
     if (app && app.apkPath && fs.existsSync(app.apkPath)) {
       const pkgs = await rt.client.shell(`pm list packages ${pkg}`, { timeout: 8000 }).catch(() => '');
       if (!new RegExp(`package:${pkg.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}`).test(pkgs)) {
-        onLog('应用尚未安装，正在自动安装…');
-        await rt.client.install(app.apkPath).catch((e) => onLog(`自动安装失败：${e.message}`));
+        onLog('The app is not installed yet — installing it now…');
+        await rt.client.install(app.apkPath).catch((e) => onLog(`Auto-install failed: ${e.message}`));
       }
     }
-    // 观察 25 秒并要求「连续存活 5 秒」才算启动成功。
-    // 关键：进程"还没起来"和"起来过又没了"必须分开看。以前一看到 pidof 为空就判失败，
-    // 结果大型应用（红果这种首启要十几秒的）在加载途中就被 force-stop 重启，
-    // 反复三轮才勉强起来，用户感知就是"点了要等一分钟"。
+    // Watch for 25 s and require 5 s of continuous life to call it a successful launch.
+    // 'not up yet' and 'was up and died' must be distinguished; treating an empty pidof as
+    // failure force-stopped large apps during their ten-second first load,
+    // three rounds before they opened — 'click and wait a minute'.
     const staysAlive = async () => {
       const t0 = Date.now();
       let aliveSince = 0;
       let seen = false;
       while (Date.now() - t0 < 25000) {
-        // 先查再睡：常驻容器里热启动往往 1 秒内就能看到进程，
-        // 先 sleep 1 秒等于把最快的那条路径硬生生拖慢一秒。
+        // Check before sleeping: in a warm container the process shows up within a second,
+        // sleeping first would delay the fastest path by a second.
         // eslint-disable-next-line no-await-in-loop
         const pid = await rt.client.shell(`pidof ${pkg}`, { timeout: 6000 }).catch(() => '');
         if (!String(pid).trim()) {
-          if (seen) return false; // 起来过又消失 = 真的崩了
+          if (seen) return false; // appeared and vanished — it really crashed
         } else {
           seen = true;
           if (!aliveSince) aliveSince = Date.now();
@@ -472,11 +509,11 @@ class Installer {
         // eslint-disable-next-line no-await-in-loop
         await sleep(700);
       }
-      return seen; // 一直没见过进程才算失败
+      return seen; // failure only if the process never appeared
     };
     try {
-      // 先确保运行时权限齐备：安装时的 -g 在清过数据后可能失效，
-      // 缺权限时应用会被系统授权框挡住，用户看到的就是「点了没反应/打不开」。
+      // Make sure runtime permissions are granted first: -g is lost when data is cleared,
+      // and a missing grant leaves the app behind a system dialog — 'click does nothing'.
       await rt.client.grantRuntimePermissions(pkg).catch(() => {});
       onMark('permissions granted');
       let ok = false;
@@ -484,7 +521,7 @@ class Installer {
         if (attempt > 1) {
           // eslint-disable-next-line no-await-in-loop
           await rt.client.forceStop(pkg).catch(() => {});
-          // 授权框挡在最前面时，应用看起来就是「打不开」；先补授权再收掉弹窗
+          // A permission dialog in front makes the app look broken; grant, then dismiss
           // eslint-disable-next-line no-await-in-loop
           await rt.client.grantRuntimePermissions(pkg).catch(() => {});
           // eslint-disable-next-line no-await-in-loop
@@ -497,14 +534,14 @@ class Installer {
           // eslint-disable-next-line no-await-in-loop
           await start();
         } catch (e) {
-          // 有明确崩溃日志才交给外层（可能要切兼容镜像）；没有证据多半只是启动慢，重试即可
+          // Only a clear crash log escalates (may need the compatible image); otherwise it is just slow
           if (e.code === 'APP_CRASHED' && e.crash) throw e;
           started = false;
         }
         onMark(`am start #${attempt} ${started ? 'ok' : 'fail'}`);
-        // Activity 起来后立刻把方向锁死。放在这里是因为应用启动过程本身会触发
-        // 配置变更（Activity 重建），启动前设的 user-rotation 可能被系统重置回 0 ——
-        // 一旦回 0，横屏面板上的画面就会躺倒 90°（用户看到的就是「转不正」）。
+        // Lock the orientation right after the activity appears: the launch itself triggers
+        // a config change (activity recreation) that can reset user-rotation to 0 —
+        // after that the landscape panel shows a 90° rotated picture ('won't turn upright').
         if (started) {
           // eslint-disable-next-line no-await-in-loop
           await rt.client.setOrientation(!!(store.getSettings().display || {}).landscape).catch(() => {});
@@ -512,15 +549,15 @@ class Installer {
         // eslint-disable-next-line no-await-in-loop
         ok = started ? await staysAlive() : false;
         onMark(`alive #${attempt} ${ok}`);
-        if (!ok && attempt < 3) onLog(`应用启动后退出（第 ${attempt} 次），正在自动重试…`);
+        if (!ok && attempt < 3) onLog(`The app exited after launch (attempt ${attempt}), retrying…`);
       }
       if (!ok) {
-        // 兜底：异常退出会留下「半初始化」的数据，导致之后每次都崩。
-        // 清一次应用数据再拉起来，成功率最高（用户不必自己去设置里清缓存）。
-        onLog('应用连续退出，正在重置应用数据后重试…');
+        // Fallback: a crash leaves half-initialised data and every later start fails.
+        // Clearing app data once before relaunch works best (no manual cache clear needed).
+        onLog('The app keeps exiting — clearing its data and retrying…');
         await rt.client.shell(`pm clear ${pkg}`, { timeout: 20000 }).catch(() => '');
         await sleep(800);
-        // pm clear 会把运行时权限一并清掉，必须重新授，否则会卡在系统授权框
+        // pm clear also drops runtime permissions, so they must be granted again or the dialog blocks
         await rt.client.grantRuntimePermissions(pkg).catch(() => {});
         await start().catch((e) => {
           if (e.code === 'APP_CRASHED' && e.crash) throw e;
@@ -529,18 +566,18 @@ class Installer {
         if (!ok) await rt.client.dismissPermissionDialog().catch(() => {});
       }
       if (!ok) {
-        const err = new Error('应用启动后立即退出，已自动重试并重置应用数据仍未成功');
+        const err = new Error('The app exits immediately after launch; retries and a data reset did not help');
         err.code = 'APP_UNSTABLE';
         throw err;
       }
     } catch (e) {
       if (e.code === 'APP_CRASHED' && !this.runtime.provisioner.playImageInfo().ok) {
-        // 崩溃来自 ARM 翻译层：自动切镜像、重装备份 APK、再启动一次
-        onLog('检测到 ARM 翻译层崩溃，正在自动切换兼容镜像…');
+        // The crash comes from the ARM translation layer: switch image, reinstall and launch again
+        onLog('ARM translation layer crash detected — switching to the compatible image…');
         await this.ensureCompatImage(onLog ? (m) => onLog(m.message || '') : () => {});
         const rt2 = await this.switchToCompat((m) => onLog(m.message || ''));
         if (app && app.apkPath && fs.existsSync(app.apkPath)) {
-          try { await rt2.client.install(app.apkPath); } catch (_) { /* 保留原包 */ }
+          try { await rt2.client.install(app.apkPath); } catch (_) { /* keep the original package */ }
         }
         await rt2.client.startApp(app ? app.package : pkg, app ? app.activity : null, {
           freeform: settings.freeform,

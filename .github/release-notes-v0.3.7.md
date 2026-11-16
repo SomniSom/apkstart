@@ -1,49 +1,61 @@
 # ApkStart v0.3.7
 
-> 一句话：修好**应用窗口右上角的关闭（关掉要真正结束安卓应用）**，并把**虚拟机网络**从「等运气」改成「自动自愈」；CI 同步 Gitee 的 token 也配好了。
+> One line: **the window close button now really stops the Android app**, and the **VM
+> network** goes from "wait and hope" to automatic self-healing; the CI Gitee token is set up.
 
-## 一、修复：右上角窗口按钮，关闭现在会真正结束应用
+## 1. Fix: the close button now really ends the app
 
-**问题**：点标题栏的 ⨯，窗口消失了，但安卓应用还在后台跑；再点开那个应用时看起来像「没关掉过」。
+**Problem**: clicking the ⨯ in the title bar removed the window but the Android app kept
+running in the background, so reopening it looked as if it had never been closed.
 
-**原因**：`shell:close` 直接调了 Electron 的 `win.close()`，绕过了 `AppWindow.close()` 的收尾逻辑。窗口的 `closed` 事件只清了内部状态，**既没有 `force-stop` 安卓应用，也没有把模拟器窗口从宿主上摘下来**。走 Alt+F4 / 任务栏关闭时同样如此。
+**Cause**: `shell:close` called Electron's `win.close()` directly and bypassed
+`AppWindow.close()`. The window's `closed` event only cleared internal state: **no
+`force-stop` of the Android app and no detach of the emulator window from the host**.
+Alt+F4 and closing from the taskbar behaved the same way.
 
-**修复**：
+**Fix**:
 
-- ⨯ 按钮改为走 `appWin.close()`：先把模拟器窗口摘下藏好，再 `am force-stop` 停掉安卓应用；
-- `closed` 事件也补上同样的收尾（覆盖 Alt+F4、任务栏关闭、系统关机等路径）；
-- 旋转 / 最小化 / 最大化逻辑保持原样，未改动。
+- the ⨯ button goes through `appWin.close()`: the emulator window is detached and hidden,
+  then `am force-stop` stops the Android app;
+- the `closed` event performs the same cleanup (covers Alt+F4, taskbar close and system shutdown);
+- rotation / minimise / maximise are unchanged.
 
-**实测**：向应用窗口发 `WM_CLOSE` 后，`pidof com.phoenix.read` 从 `5152` 变成**空**，前台回到安卓桌面 —— 应用是真的退出了。
+**Verified**: after a `WM_CLOSE` to the app window, `pidof <package>` went from `5152` to
+**empty** and the foreground returned to the Android home screen — the app really exited.
 
-## 二、网络：不再靠运气，改成自动自愈
+## 2. Network: no longer luck, now self-healing
 
-上一版已经定位到「红果点同意后黑屏」= 虚拟机没网。但当时只是"多等一会儿"，遇上 Wi-Fi 一直不关联的启动还是会超时。
+The previous release established that the black screen was "the VM has no network" but
+only "waited longer"; a boot where Wi-Fi never associates still timed out.
 
-本版把网络处理改成**按代价从小到大自动升级**：
+This release escalates **from cheapest to most expensive**:
 
-1. **启动应用前先等网络**（最多 60s，日志可见进度）；
-2. 等不到就**冷启动一次虚拟机**（`-no-snapshot-load`，绕开可能是"没网"时存下的快速启动快照），再等最多 180s；
-3. 网络一通就**立刻存快照**，下次恢复时网卡状态一起还原；
-4. 「设置 → 修复网络」用同一套流程，只有前两步都失败才**重置安卓数据**（应用清单保留、点开会自动重装，但应用内登录态/记录会丢）。
+1. **wait for the network before launching** (up to 60 s, progress in the log);
+2. if that fails, **cold-boot the VM once** (`-no-snapshot-load`, skipping a quickboot
+   snapshot that may have been saved without a network) and wait up to 180 s more;
+3. as soon as the network is up, **save a snapshot immediately**, so the adapter state
+   comes back with the snapshot;
+4. "Settings -> Repair network" runs the same sequence and only **resets the Android data**
+   when the first two steps fail (the app list is kept and apps reinstall on launch, but
+   in-app accounts and history are lost).
 
-> 关于「提高安卓版本」：这次没有换镜像。原因是换镜像要让所有用户重新下载 1.5 GB，
-> 而实测问题的根子在**模拟器 Wi-Fi 关联慢/偶发不关联**，不在 Android 版本本身；
-> 用「等待 + 冷启动自愈」能在不增体积的前提下覆盖同样场景。若后续证明某版本镜像更稳，
-> 再单独发版迁移。
+> On "upgrade the Android version": the image was not changed. Replacing it would force
+> every user to re-download 1.5 GB, while the measured root cause is slow or missing Wi-Fi
+> association in the emulator, not the Android version. Waiting plus a cold-boot cures the
+> same cases without growing the package.
 
-## 三、CI：Gitee 同步的 token 已配好
+## 3. CI: the Gitee sync token is configured
 
-GitHub 仓库的 Actions secret `GITEE_TOKEN` 已写入，以后打 `v*` 标签发布时，
-Release 工作流会自动把便携版同步到 Gitee，不用再手动跑脚本。
+The `GITEE_TOKEN` Actions secret is in place, so publishing a `v*` tag makes the release
+workflow mirror the portable build to Gitee automatically.
 
-## 四、实测
+## 4. Verified
 
-- `npm test`：**113 项全部通过**（8 + 25 + 80）。
-- 关闭窗口后 `pidof com.phoenix.read` 为空（应用真正退出）。
-- 网络就绪日志：`虚拟机网络就绪（10.0.2.16）`，随后红果首页正常渲染。
+- `npm test`: **113 checks passed** (8 + 25 + 80).
+- After closing the window `pidof` is empty (the app really exits).
+- Network log: `VM network ready (10.0.2.16)`, after which the home page renders normally.
 
-## 五、升级方式
+## 5. Upgrading
 
-- 便携版：解压覆盖，数据目录（默认 `%APPDATA%\apkstart`）保持不变。
-- 安装版：直接安装覆盖。
+- Portable: unpack over the old copy; the data directory is untouched.
+- Installed build: install over the old version.

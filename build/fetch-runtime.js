@@ -1,10 +1,11 @@
 'use strict';
 /**
- * 组装「完整版」内置运行时：
- *   node build/fetch-runtime.js <输出目录>
- * 产出 <输出目录>/runtime/：
- *   emulator/ + platform-tools/ + aehd/ + system-images/android-34/google_apis_playstore/x86_64/
- * 全部通过 Provisioner 的官方通道下载与校验，与在线版完全同源。
+ * Assemble the built-in runtime for the full build:
+ *   node build/fetch-runtime.js <output-dir>
+ * Produces <output-dir>/runtime/:
+ *   emulator/ + platform-tools/ + system-images/android-34/google_apis_playstore/x86_64/
+ * Everything is downloaded and verified through the Provisioner's official channel,
+ * so it is byte-identical to what the online build fetches.
  */
 const path = require('path');
 const fs = require('fs');
@@ -16,9 +17,10 @@ if (!outRoot) {
 }
 fs.mkdirSync(outRoot, { recursive: true });
 
-// Provisioner 从 settings.runtime.dir 取根目录：
-// 把 APPDATA 指到独立目录，避免污染真实用户配置
-process.env.APPDATA = path.join(outRoot, '_appdata');
+// The Provisioner reads its root from settings.runtime.dir; point XDG dirs at a
+// scratch directory so the real user config is never touched.
+process.env.XDG_CONFIG_HOME = path.join(outRoot, '_appdata', 'config');
+process.env.XDG_DATA_HOME = path.join(outRoot, '_appdata', 'data');
 const store = require('../src/core/store');
 store.saveSettings({ runtime: { dir: outRoot } });
 
@@ -28,19 +30,18 @@ const prov = new Provisioner(path.resolve(__dirname, '..'));
 const log = (p) => console.log(`[${p.stage}] ${p.message} ${p.percent != null ? p.percent + '%' : ''}`);
 
 (async () => {
-  await prov.installAehd(log);
   await prov.installAdb(log);
   await prov.installEmulator(log);
   await prov.installPlayImage(log);
 
   const ok =
-    fs.existsSync(path.join(outRoot, 'emulator', 'emulator.exe')) &&
-    fs.existsSync(path.join(outRoot, 'platform-tools', 'adb.exe')) &&
+    fs.existsSync(path.join(outRoot, 'emulator', 'emulator')) &&
+    fs.existsSync(path.join(outRoot, 'platform-tools', 'adb')) &&
     fs.existsSync(path.join(outRoot, 'system-images', 'android-34', 'google_apis_playstore', 'x86_64', 'system.img'));
-  if (!ok) throw new Error('运行时组装后校验失败');
+  if (!ok) throw new Error('runtime assembly failed its own self-check');
 
-  // 容器式精简：只保留 x86_64 的 QEMU 与无头运行必需的组件。
-  // 非 x86_64 的 qemu-system-*.exe（约 400MB）、QtWebEngine、netsim 等对 -no-window 无用。
+  // Container-style pruning: keep only the x86_64 QEMU and what a headless run needs.
+  // Foreign-arch QEMU binaries (~400 MB), QtWebEngine and netsim are useless here.
   const layers = require('../src/core/layers');
   const pruned = layers.prune(outRoot, { apply: true, aggressive: true });
   const before = layers.analyze(outRoot).total + pruned.saved;

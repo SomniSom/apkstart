@@ -1,12 +1,12 @@
 /* ============================================================================
- * theme.css —— 全局视觉刷新（在 style.css 之后加载，只做覆盖与增强）
+ * theme.css — global visual refresh (loaded after style.css, overrides only)
  *
- * 设计目标：更"安卓运行器"的气质 —— 深绿品牌色 + 干净的浅色面板 + 圆润的卡片，
- * 同时把启动时的欢迎卡做成一整套统一语言。
+ * Design goal: an 'Android runner' feel — emerald brand colour, clean light panels, rounded cards,
+ * with the welcome card speaking the same language.
  * ========================================================================== */
 
 :root {
-  /* 品牌：翡翠绿 → 青绿渐变 */
+  /* brand: emerald to teal gradient */
   --brand: #0f9d63;
   --brand-dark: #0b7d4f;
   --brand-2: #12b886;
@@ -43,7 +43,7 @@ html, body {
     var(--bg);
 }
 
-/* ---------------- 标题栏：玻璃质感 ---------------- */
+/* ---------------- titlebar: glass ---------------- */
 
 .titlebar {
   height: 46px;
@@ -86,7 +86,7 @@ html, body {
 .icon-btn:hover { background: rgba(20, 32, 26, .06); color: var(--text); }
 .icon-btn:active { transform: scale(.95); }
 
-/* ---------------- 搜索框 / 主按钮 ---------------- */
+/* ---------------- search box / primary button ---------------- */
 
 .search {
   border-radius: 12px;
@@ -127,7 +127,7 @@ html, body {
 .btn.ghost { background: rgba(255, 255, 255, .6); }
 .btn.ghost:hover { background: rgba(20, 32, 26, .05); }
 
-/* ---------------- 应用卡片 ---------------- */
+/* ---------------- app card ---------------- */
 
 .grid { gap: 14px; }
 
@@ -161,7 +161,7 @@ html, body {
   box-shadow: 0 2px 8px rgba(15, 157, 99, .4);
 }
 
-/* ---------------- 状态栏 ---------------- */
+/* ---------------- status bar ---------------- */
 
 .statusbar {
   border-top: 1px solid rgba(20, 32, 26, .06);
@@ -171,7 +171,7 @@ html, body {
 
 .dot { box-shadow: 0 0 0 3px rgba(18, 184, 134, .14); }
 
-/* ---------------- 模态框 ---------------- */
+/* ---------------- modal ---------------- */
 
 .modal-mask { backdrop-filter: blur(6px); background: rgba(12, 24, 19, .34); }
 
@@ -192,7 +192,7 @@ html, body {
   letter-spacing: .3px;
 }
 
-/* ---------------- 滚动条 ---------------- */
+/* ---------------- scrollbar ---------------- */
 
 ::-webkit-scrollbar { width: 10px; height: 10px; }
 ::-webkit-scrollbar-thumb {
@@ -205,7 +205,7 @@ html, body {
 ::-webkit-scrollbar-track { background: transparent; }
 
 /* ============================================================================
- * 启动欢迎卡
+ * welcome card
  * ========================================================================== */
 
 .welcome-mask[hidden] { display: none; }
@@ -246,7 +246,7 @@ html, body {
   overflow: hidden;
 }
 
-/* 光晕 */
+/* glow */
 .welcome-halo {
   position: absolute; left: 50%; top: -120px;
   width: 340px; height: 240px; transform: translateX(-50%);

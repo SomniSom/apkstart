@@ -1,7 +1,7 @@
 'use strict';
 /**
- * 下载器：支持重定向、断点续传、进度回调、SHA-256 校验
- * 只依赖 http/https，主进程与纯 Node 测试都可使用。
+ * Downloader: redirects, resume, progress callbacks, SHA-256 verification
+ * Depends on http/https only; usable from the main process and plain Node tests.
  */
 const fs = require('fs');
 const path = require('path');
@@ -14,7 +14,7 @@ const UA = 'ApkStart/0.2 (Windows; +https://github.com/apkstart)';
 
 function openStream(url, { method = 'GET', headers = {}, redirects = 0 } = {}) {
   return new Promise((resolve, reject) => {
-    if (redirects > 6) return reject(new Error('重定向次数过多'));
+    if (redirects > 6) return reject(new Error('Too many redirects'));
     const u = new URL(url);
     const mod = u.protocol === 'http:' ? http : https;
     const req = mod.request(url, {
@@ -30,7 +30,7 @@ function openStream(url, { method = 'GET', headers = {}, redirects = 0 } = {}) {
       resolve(res);
     });
     req.on('error', reject);
-    req.on('timeout', () => { req.destroy(new Error('连接超时')); });
+    req.on('timeout', () => { req.destroy(new Error('Connection timed out')); });
     req.end();
   });
 }
@@ -60,22 +60,22 @@ function sha256File(file) {
 }
 
 /**
- * 丢弃一次失败下载留下的所有残余（半截文件 + 分块边车）。
+ * Discard everything a failed download leaves behind (partial file + chunk sidecar).
  *
- * 「一直重复下载」的根因：以前所有失败路径都只抛异常、不删文件，于是 tmp 里
- * 永远躺着一个半截 zip + .chunks.json。下次进来看到已有文件就带 Range 续传，
- * 一旦服务器/源给的总大小或分块方式和上次不一致，拼不出正确字节 → 又失败 →
- * 又留半截……每次打开都在重下同一个包。断点续传本身没错，但必须限定在「确认
- * 能续」的场景；一旦这次判定失败就整包作废，下次干净重来。
+ * Cause of endless re-downloads: every failure path used to throw without deleting files, so tmp kept
+ * a half zip + .chunks.json forever. The next run resumed with Range, and whenever the server's
+ * total size or chunking differed the bytes did not line up → fail again →
+ * another partial file… every start re-downloaded the same package. Resume itself is fine, but only when
+ * resuming is confirmed; once an attempt fails the whole file is dropped and the next run starts clean.
  */
 function discardPartial(dest) {
   for (const p of [dest, `${dest}.chunks.json`, `${dest}.part`]) {
-    try { fs.rmSync(p, { force: true }); } catch (_) { /* 被占用就算了 */ }
+    try { fs.rmSync(p, { force: true }); } catch (_) { /* in use — leave it */ }
   }
 }
 
 /**
- * 下载到本地文件（自动续传）。
+ * Download to a local file (resume automatically).
  * @param {string} url
  * @param {string} dest
  * @param {object} opt { onProgress({got,total,percent,speed}), signal, expectSha256, timeoutMs }
@@ -97,14 +97,14 @@ async function download(url, dest, opt = {}) {
 
     if (res.statusCode === 416) {
       res.resume();
-      // 已下载完整
+      // already complete
       break;
     }
     if (res.statusCode !== 200 && res.statusCode !== 206) {
       res.resume();
       if (attempt <= retries) { await new Promise((r) => setTimeout(r, 1500)); continue; }
-      discardPartial(dest);   // 重试耗尽：别把坏文件留给下次续传
-      throw new Error(`下载失败 HTTP ${res.statusCode}: ${url}`);
+      discardPartial(dest);   // retries exhausted: never leave a bad file for the next resume
+      throw new Error(`Download failed HTTP ${res.statusCode}: ${url}`);
     }
 
     const total = res.statusCode === 206
@@ -112,7 +112,7 @@ async function download(url, dest, opt = {}) {
       : Number(res.headers['content-length']) || 0;
 
     if (res.statusCode === 200 && existing > 0) {
-      // 服务器不支持续传，重头写
+      // server does not support resume — write from scratch
       fs.rmSync(dest, { force: true });
     }
 
@@ -124,9 +124,9 @@ async function download(url, dest, opt = {}) {
         let lastBytes = got;
         const ws = fs.createWriteStream(dest, { flags: startSize > 0 ? 'a' : 'w' });
 
-        // 和分块下载一样：必须保证 promise 一定会 settle。
-        // 连接静默（被墙/被限速）时 res 既不 end 也不 error，pipe 永远不 finish，
-        // 整个下载就卡死在这里，用户看到的是进度条不动、也没有报错。
+        // As with chunked downloads, the promise must always settle.
+        // On a silent connection (blocked/throttled) res neither ends nor errors and pipe never finishes,
+        // so the download hangs: the progress bar freezes and nothing is reported.
         const idleMs = Number(opt.idleMs) > 0 ? Number(opt.idleMs) : 30000;
         let settled = false;
         let idle = null;
@@ -142,12 +142,12 @@ async function download(url, dest, opt = {}) {
           if (idle) clearTimeout(idle);
           idle = setTimeout(() => {
             res.destroy();
-            finish(new Error('连接停滞（长时间无数据）'));
+            finish(new Error('Connection stalled (no data for a long time)'));
           }, idleMs);
         };
         kick();
 
-        const onAbort = () => { res.destroy(new Error('已取消')); };
+        const onAbort = () => { res.destroy(new Error('Cancelled')); };
         if (signal) signal.addEventListener('abort', onAbort, { once: true });
 
         res.on('data', (c) => {
@@ -170,17 +170,17 @@ async function download(url, dest, opt = {}) {
         ws.on('finish', () => finish());
         ws.on('error', (e) => finish(e));
         res.on('error', (e) => finish(e));
-        res.on('close', () => { if (!res.complete) finish(new Error('连接被中断')); });
+        res.on('close', () => { if (!res.complete) finish(new Error('Connection interrupted')); });
       });
     } catch (e) {
-      discardPartial(dest);   // 中断 / 超时 / 写盘失败：半截文件留着只会让下次续传继续失败
+      discardPartial(dest);   // interrupted / timed out / write failed: a partial file only breaks the next resume
       throw e;
     }
 
     break;
   }
 
-  // 收尾：确保进度条走到 100%
+  // wrap up: make sure the progress bar reaches 100%
   const finalSize = fs.existsSync(dest) ? fs.statSync(dest).size : 0;
   onProgress({ got: finalSize, total: finalSize, percent: 100, speed: 0, eta: 0 });
 
@@ -188,22 +188,22 @@ async function download(url, dest, opt = {}) {
     const actual = await sha256File(dest);
     if (actual.toLowerCase() !== expectSha256.toLowerCase()) {
       discardPartial(dest);
-      throw new Error(`校验失败：期望 ${expectSha256.slice(0, 12)}… 实际 ${actual.slice(0, 12)}…`);
+      throw new Error(`Checksum mismatch: expected ${expectSha256.slice(0, 12)}… got ${actual.slice(0, 12)}…`);
     }
   }
   return { file: dest, size: fs.statSync(dest).size };
   } catch (e) {
-    // openStream 直接 reject（连接被拒 / DNS 失败 / 超时）不会进入写流那段
-    // try/catch —— 统一在最外层兜住：任何抛出都先丢弃残余。
+    // A direct openStream reject (refused / DNS failure / timeout) never reaches the write stage —
+    // catch everything at the outer level so any throw first discards the remains.
     discardPartial(dest);
     throw e;
   }
 }
 
 /**
- * 并行分块下载（大文件专用）。
- * 单条 TCP 连接在部分镜像上会被限速到几十 KB/s，分块并发能显著提升实际吞吐。
- * 仅在「目标文件不存在」时并行；已有部分文件时退回单流续传，避免分块状态丢失。
+ * Parallel chunked download (large files only).
+ * Some mirrors throttle a single TCP connection to tens of KB/s; parallel chunks raise real throughput.
+ * Parallel only when the target does not exist; a partial file falls back to single-stream resume.
  */
 async function downloadParallel(url, dest, opt = {}) {
   const {
@@ -213,12 +213,12 @@ async function downloadParallel(url, dest, opt = {}) {
     retries = 3,
   } = opt;
 
-  // 已有部分文件 → 交给单流续传
+  // partial file present — hand over to single-stream resume
   if (fs.existsSync(dest) && fs.statSync(dest).size > 0) {
     return download(url, dest, opt);
   }
 
-  // 探测是否支持 Range
+  // probe Range support
   let total = 0;
   let supportsRange = false;
   try {
@@ -231,7 +231,7 @@ async function downloadParallel(url, dest, opt = {}) {
       total = Number(probe.headers['content-length']) || 0;
     }
     probe.destroy();
-  } catch (_) { /* 探测失败则走单流 */ }
+  } catch (_) { /* probe failed — use a single stream */ }
 
   if (!supportsRange || !total || total < minChunk * 2) {
     return download(url, dest, opt);
@@ -243,7 +243,7 @@ async function downloadParallel(url, dest, opt = {}) {
   fs.mkdirSync(path.dirname(dest), { recursive: true });
   fs.rmSync(dest, { force: true });
 
-  // 先建空文件并定位到末字节，避免后续 write 越界
+  // Create the file and seek to its end first so later writes stay in range
   const fd = fs.openSync(dest, 'w');
   fs.ftruncateSync(fd, total);
 
@@ -274,11 +274,11 @@ async function downloadParallel(url, dest, opt = {}) {
     const res = await openStream(url, { headers: { Range: `bytes=${c.pos}-${c.end}` } });
     if (res.statusCode !== 206) {
       res.resume();
-      throw new Error(`分块请求被拒绝 HTTP ${res.statusCode}`);
+      throw new Error(`Chunk request rejected HTTP ${res.statusCode}`);
     }
     await new Promise((resolve, reject) => {
-      // 必须自己兜住「promise 永远不 settle」：res.destroy(err) 在某些情况下只发
-      // close 不发 error，没有这个 guard 的话一整块会挂死，整个下载停在那里不动。
+      // Guard against a promise that never settles: res.destroy(err) can emit
+      // close without error, which would hang one chunk and freeze the whole download.
       let settled = false;
       const finish = (err) => {
         if (settled) return;
@@ -286,10 +286,10 @@ async function downloadParallel(url, dest, opt = {}) {
         clearTimeout(idle);
         if (err) reject(err); else resolve();
       };
-      let idle = setTimeout(() => { res.destroy(); finish(new Error('连接停滞（长时间无数据）')); }, idleMs);
+      let idle = setTimeout(() => { res.destroy(); finish(new Error('Connection stalled (no data for a long time)')); }, idleMs);
       const kick = () => {
         clearTimeout(idle);
-        idle = setTimeout(() => { res.destroy(); finish(new Error('连接停滞（长时间无数据）')); }, idleMs);
+        idle = setTimeout(() => { res.destroy(); finish(new Error('Connection stalled (no data for a long time)')); }, idleMs);
       };
       res.on('data', (buf) => {
         try {
@@ -305,7 +305,7 @@ async function downloadParallel(url, dest, opt = {}) {
       });
       res.on('end', () => finish());
       res.on('error', (e) => finish(e));
-      res.on('close', () => finish(new Error('连接被中断')));
+      res.on('close', () => finish(new Error('Connection interrupted')));
     });
     return c.pos > c.end;
   };
@@ -317,10 +317,10 @@ async function downloadParallel(url, dest, opt = {}) {
           // eslint-disable-next-line no-await-in-loop
           const ok = await fetchChunk(c);
           if (ok) return;
-          throw new Error('分块未完整返回');
+          throw new Error('Chunk returned incomplete');
         } catch (e) {
           c.tries += 1;
-          if (c.tries >= retries) throw new Error(`分块下载失败（${c.start}-${c.end}）：${e.message}`);
+          if (c.tries >= retries) throw new Error(`Chunk download failed (${c.start}-${c.end}): ${e.message}`);
           // eslint-disable-next-line no-await-in-loop
           await new Promise((r) => setTimeout(r, 800 * c.tries));
         }
@@ -328,7 +328,7 @@ async function downloadParallel(url, dest, opt = {}) {
     }));
   } catch (e) {
     try { fs.closeSync(fd); } catch (_) { /* ignore */ }
-    discardPartial(dest);   // 整包作废，别留半截文件给下次续传
+    discardPartial(dest);   // drop the whole file; never resume from a broken one
     throw e;
   }
   fs.closeSync(fd);
@@ -337,16 +337,16 @@ async function downloadParallel(url, dest, opt = {}) {
   onProgress({ got: size, total: size, percent: 100, speed: 0, eta: 0 });
   if (size !== total) {
     discardPartial(dest);
-    throw new Error(`下载不完整：${size}/${total} 字节`);
+    throw new Error(`Incomplete download: ${size}/${total} bytes`);
   }
   return { file: dest, size, parallel: n };
 }
 
-/** 依次尝试多个源，任一成功即返回 */
+/** Try sources in order and return on the first success */
 async function downloadAny(urls, dest, opt = {}) {
   const errors = [];
   for (const u of urls) {
-    discardPartial(dest);   // 换源前清掉上一个源的半截文件（跨源字节不可混用）
+    discardPartial(dest);   // clear the previous source's partial file (bytes from different sources must not mix)
     try {
       // eslint-disable-next-line no-await-in-loop
       const r = await download(u, dest, opt);
@@ -356,36 +356,36 @@ async function downloadAny(urls, dest, opt = {}) {
       discardPartial(dest);
     }
   }
-  throw new Error(`所有下载源均失败：\n${errors.join('\n')}`);
+  throw new Error(`All download sources failed:\n${errors.join('\n')}`);
 }
 
 /**
- * 多源同时下载：把文件切成若干块，**不同块同时从不同源拉**，带宽叠加。
+ * Multi-source download: split the file into chunks and pull different chunks from different sources.
  *
- * 为什么需要：GitHub 单连接限速很常见，而镜像站通常也各自限速；
- * 8 条连接都指向同一个地址时，天花板就是那个地址的上限。把 4 条给 GitHub、
- * 4 条给镜像，两者上限相加，实测能快一倍以上。
+ * Why: GitHub throttles single connections and mirrors throttle too;
+ * eight connections to one host cap at that host. Four to GitHub and four to a mirror
+ * add up — measured twice as fast.
  *
- * 安全前提：只有「声明总大小一致」的源才会被混用，否则可能拼出坏文件；
- * 任一源中途失败，它的分块会自动换到下一条可用地址重试（不整包重来）。
+ * Safety: only sources that declare the same total size are mixed, otherwise the file would be corrupt;
+ * chunks of a failing source move to the next address automatically (no full restart).
  */
 async function downloadMulti(urls, dest, opt = {}) {
   const {
     connections = 8,
     onProgress = () => {},
     minChunk = 2 * 1024 * 1024,
-    // 每个分块的重试次数。3 次在「三个源里有两个偶尔停摆」的链路上不够用：
-    // 1.4GB 的运行时包一旦有块耗尽重试，整包作废重下。给到 6 次（每源两轮）。
-    // 重试是从断点继续的（c.pos 保留），不会重复下载已收到的字节。
+    // Retries per chunk. Three was not enough with two flaky sources out of three:
+    // one exhausted chunk dropped a 1.4 GB runtime. Six (two rounds per source).
+    // Retries resume from c.pos, so received bytes are not downloaded twice.
     retries = 6,
   } = opt;
   const idleMs = Number(opt.idleMs) > 0 ? Number(opt.idleMs) : 20000;
 
   const list = [...new Set((urls || []).filter(Boolean))];
-  if (!list.length) throw new Error('没有可用的下载地址');
+  if (!list.length) throw new Error('No download address available');
   if (list.length === 1) return downloadParallel(list[0], dest, opt);
 
-  // 1) 并行探测：总大小 + 是否支持 Range
+  // 1) parallel probe: total size + Range support
   const probes = await Promise.all(list.map(async (u) => {
     try {
       const res = await openStream(u, { headers: { Range: 'bytes=0-0' } });
@@ -402,26 +402,26 @@ async function downloadMulti(urls, dest, opt = {}) {
   if (!usable.length) {
     return downloadAnyParallel(list, dest, opt);
   }
-  // 只混用「声明总大小一致」的源，否则会拼出坏文件。
-  // 基准取**实测最快那个源的总大小**（usable 的顺序就是 rank() 排好的速度序，
-  // 探测是 Promise.all 但结果按输入顺序返回）：
-  // GitHub 与 Gitee 各自压出来的包字节数不同（差几 MB 很正常），
-  // 以前固定取 Math.max，等于永远去下体积更大的那个源 —— 国内网络下
-  // 反而是「更快的 Gitee 包被排除、被迫走慢的 GitHub 包」。
+  // Only mix sources that declare the same total size, otherwise the file is corrupt.
+  // The baseline is the total size of the FASTEST source (usable is speed-ranked,
+  // Promise.all keeps the input order):
+  // GitHub and Gitee packages differ by a few MB,
+  // and taking Math.max always picked the bigger one — on slow networks
+  // the faster Gitee package got excluded in favour of the slow GitHub one.
   const total = usable[0].total;
   const same = usable.filter((p) => p.total === total);
   if (same.length === 1 || total < minChunk * 2) {
     return downloadParallel(same[0].url, dest, opt);
   }
 
-  // 2) 切块，轮转分配源
+  // 2) split into chunks, assign sources round-robin
   const n = Math.max(2, Math.min(connections, Math.ceil(total / minChunk)));
   const per = Math.ceil(total / n);
   fs.mkdirSync(path.dirname(dest), { recursive: true });
 
-  // 分块断点续传：1.4GB 的包在「镜像偶尔停摆」的链路上很容易有块耗尽重试，
-  // 一旦整包作废重下，用户要再等十几分钟。这里把「哪些块已经下完」记在
-  // 边车文件里，下次（同一路径、同一分块方式）只补缺的块。
+  // Chunked resume: on flaky mirrors a 1.4 GB package easily exhausts chunk retries,
+  // and a full restart costs another fifteen minutes. Finished chunks are recorded in
+  // a sidecar file, so the next run (same path and chunking) fetches only the gaps.
   const meta = `${dest}.chunks.json`;
   let doneSet = new Set();
   let resume = false;
@@ -431,7 +431,7 @@ async function downloadMulti(urls, dest, opt = {}) {
       doneSet = new Set(m.done || []);
       resume = true;
     }
-  } catch (_) { /* 没有边车就全新下 */ }
+  } catch (_) { /* no sidecar — start fresh */ }
 
   if (!resume) {
     fs.rmSync(dest, { force: true });
@@ -446,16 +446,16 @@ async function downloadMulti(urls, dest, opt = {}) {
     pos: i * per,
     src: i % same.length,
     tries: 0,
-    rotates: 0,   // 必须显式初始化：undefined < 2 是 false，换源永远不会触发
+    rotates: 0,   // must be initialised: undefined < 2 is false and source rotation never fires
   })).filter((c) => !doneSet.has(c.start));
 
   const saveMeta = () => {
     try {
       fs.writeFileSync(meta, JSON.stringify({ total, n, done: [...doneSet] }));
-    } catch (_) { /* 边车写不进去不影响下载 */ }
+    } catch (_) { /* a sidecar write failure does not stop the download */ }
   };
 
-  // 续传时把已完成的块算进进度，用户看到的百分比不会从 0 重来
+  // Count finished chunks into the progress so the percentage does not restart at 0
   let got = resume ? [...doneSet].reduce((sum, start) => (
     sum + (Math.min(total - 1, start + per - 1) - start + 1)
   ), 0) : 0;
@@ -477,9 +477,9 @@ async function downloadMulti(urls, dest, opt = {}) {
     });
   };
 
-  // 低速换源：某一块从某个源只跑到几十 KB/s 时，光等它下完会把整个下载拖成
-  // 「卡在 95% 不动」。跑够 slowAfterMs 且平均速度低于 slowBps 就中断、换下一个源
-  // （从断点继续，不丢数据）。每块最多换 2 次，避免在几个慢源之间来回横跳。
+  // Slow-source rotation: a chunk crawling at tens of KB/s drags the whole download to
+  // 'stuck at 95%'. After slowAfterMs below slowBps it is aborted and moved to the next source
+  // (resuming from c.pos). Two rotations per chunk at most, to avoid ping-ponging.
   const slowAfterMs = Number(opt.slowAfterMs) > 0 ? Number(opt.slowAfterMs) : 45000;
   const slowBps = Number(opt.slowBps) > 0 ? Number(opt.slowBps) : 120 * 1024;
 
@@ -488,18 +488,18 @@ async function downloadMulti(urls, dest, opt = {}) {
     const res = await openStream(url, { headers: { Range: `bytes=${c.pos}-${c.end}` } });
     if (res.statusCode !== 206) {
       res.resume();
-      throw new Error(`分块被拒绝 HTTP ${res.statusCode}`);
+      throw new Error(`Chunk rejected HTTP ${res.statusCode}`);
     }
     const startPos = c.pos;
     const startedAt = Date.now();
-    // 同一条连接 destroy 之后仍可能再收到已缓冲的包，会重复触发换源、把源跳过头，
-    // 所以每次请求只允许换一次。
+    // After destroy, a connection may still deliver buffered packets and rotate the source twice,
+    // so each request may rotate only once.
     let rotated = false;
     await new Promise((resolve, reject) => {
-      // 空闲看门狗 + 「保证 settle」：连接建立了但一个字节都不来（常见的
-      // 「TCP 通但被墙/被限」），光等 socket 超时要 30 秒；而 res.destroy(err)
-      // 可能只发 close 不发 error，promise 就永远不会 reject —— 表现是一块挂死、
-      // 整个下载停在那里（实测踩过）。所以看门狗自己调用 finish。
+      // Idle watchdog + guaranteed settle: the connection is up but no byte arrives (typical
+      // 'TCP open but blocked/throttled'); the socket timeout alone takes 30 s, and res.destroy(err)
+      // may emit close without error so the promise never rejects — one chunk hangs and
+      // the download stalls (seen in practice). Hence the watchdog calls finish itself.
       let settled = false;
       const finish = (err) => {
         if (settled) return;
@@ -507,10 +507,10 @@ async function downloadMulti(urls, dest, opt = {}) {
         clearTimeout(idle);
         if (err) reject(err); else resolve();
       };
-      let idle = setTimeout(() => { res.destroy(); finish(new Error('连接停滞（长时间无数据）')); }, idleMs);
+      let idle = setTimeout(() => { res.destroy(); finish(new Error('Connection stalled (no data for a long time)')); }, idleMs);
       const kick = () => {
         clearTimeout(idle);
-        idle = setTimeout(() => { res.destroy(); finish(new Error('连接停滞（无数据超时）')); }, idleMs);
+        idle = setTimeout(() => { res.destroy(); finish(new Error('Connection stalled (no-data timeout)')); }, idleMs);
       };
       res.on('data', (buf) => {
         try {
@@ -523,22 +523,22 @@ async function downloadMulti(urls, dest, opt = {}) {
         got += buf.length;
         kick();
         tick(false);
-        // 还没下完就慢到不可接受 → 换源（c.pos 已前进，下次从断点继续）
+        // Not done and too slow → rotate (c.pos advanced, resume from there)
         const took = Date.now() - startedAt;
         if (!rotated && took > slowAfterMs && (c.rotates || 0) < 2 && c.pos <= c.end) {
           const bps = (c.pos - startPos) / (took / 1000);
           if (bps < slowBps) {
             rotated = true;
             c.rotates = (c.rotates || 0) + 1;
-            // 这里不推进 c.src：换源统一由下面的 catch 做，否则一次失败会跳两个源
+            // c.src is not advanced here: the catch below rotates, otherwise one failure would skip two sources
             res.destroy();
-            finish(new Error(`该源速度过低（${(bps / 1024).toFixed(0)} KB/s），换源重试`));
+            finish(new Error(`Source too slow (${(bps / 1024).toFixed(0)} KB/s), switching`));
           }
         }
       });
       res.on('end', () => finish());
       res.on('error', (e) => finish(e));
-      res.on('close', () => finish(new Error('连接被中断')));
+      res.on('close', () => finish(new Error('Connection interrupted')));
     });
     return c.pos > c.end;
   };
@@ -553,17 +553,17 @@ async function downloadMulti(urls, dest, opt = {}) {
             saveMeta();
             return;
           }
-          throw new Error('分块未完整返回');
+          throw new Error('Chunk returned incomplete');
         } catch (e) {
           c.tries += 1;
           if (c.tries >= retries) {
-            // 重试耗尽：这份文件里已经混进了「从不同源拉来的块」，再续传也
-            // 拼不出正确字节。整包 + 边车一起作废，下次干净重来。
-            // 以前这里只 saveMeta() 保留，结果每次打开都从坏块继续 → 无限重下。
+            // Retries exhausted: the file already mixes chunks from different sources and can
+            // never assemble correctly. Drop the file and the sidecar; start clean next time.
+            // It used to saveMeta() instead, so every start resumed from a bad chunk → endless re-download.
             discardPartial(dest);
-            throw new Error(`分块失败（${c.start}-${c.end}）：${e.message}`);
+            throw new Error(`Chunk failed (${c.start}-${c.end}): ${e.message}`);
           }
-          // 换一个源再试：一个镜像抽风不该拖垮整个下载
+          // Try another source: one flaky mirror must not fail the whole download
           c.src += 1;
           // eslint-disable-next-line no-await-in-loop
           await new Promise((r) => setTimeout(r, 600 * c.tries));
@@ -582,16 +582,16 @@ async function downloadMulti(urls, dest, opt = {}) {
   tick(true);
   if (size !== total) {
     discardPartial(dest);
-    throw new Error(`下载不完整：${size}/${total} 字节`);
+    throw new Error(`Incomplete download: ${size}/${total} bytes`);
   }
   return { file: dest, size, parallel: n, sources: same.length, multi: true, resumed: resume };
 }
 
-/** 依次尝试多个源（并行分块版），任一成功即返回 */
+/** Try several sources in order (parallel chunked) and return on the first success */
 async function downloadAnyParallel(urls, dest, opt = {}) {
   const errors = [];
   for (const u of urls) {
-    discardPartial(dest);   // 换源前清掉上一个源的半截文件
+    discardPartial(dest);   // clear the previous source's partial file
     try {
       // eslint-disable-next-line no-await-in-loop
       const r = await downloadParallel(u, dest, opt);
@@ -601,7 +601,7 @@ async function downloadAnyParallel(urls, dest, opt = {}) {
       discardPartial(dest);
     }
   }
-  throw new Error(`所有下载源均失败：\n${errors.join('\n')}`);
+  throw new Error(`All download sources failed:\n${errors.join('\n')}`);
 }
 
 module.exports = {

@@ -1,13 +1,13 @@
 'use strict';
 /**
- * 容器式分层：只读基础镜像 + 精简运行时 + 可回收的临时层
+ * Container-style layering: read-only base image + slim runtime + reclaimable scratch layer
  *
- * 比喻（和 Docker 一样）：
- *   system-images/  = 只读 base layer，所有应用、所有会话共享一份，绝不复制
- *   avd/*.avd/      = 可写 thin layer（qcow2 差量 + quickboot 快照），只存改动
- *   _tmp/ snapshots = 可回收的 scratch layer
+ * The analogy (same as Docker):
+ *   system-images/  = read-only base layer shared by every app and session, never copied
+ *   avd/*.avd/      = writable thin layer (qcow2 delta + quickboot snapshot), only changes
+ *   _tmp/ snapshots = reclaimable scratch layer
  *
- * 本模块只做「盘点」与「按明确清单回收」，默认 dryRun，不碰用户个人文件。
+ * This module only inventories and reclaims by explicit list; dry-run by default, user files untouched.
  */
 const fs = require('fs');
 const path = require('path');
@@ -30,7 +30,7 @@ function dirSize(dir) { return walk(dir).reduce((n, f) => n + f.size, 0); }
 const exists = (p) => { try { return fs.existsSync(p); } catch (_) { return false; } };
 
 /**
- * 盘点运行时占用，并列出「可安全回收」的条目。
+ * Inventory the runtime and list entries that can be reclaimed safely.
  * @returns {{total:number, groups:Array, candidates:Array}}
  */
 function analyze(root, { keepAvd = 'apkstart.avd', aggressive = false, keepSnapshots = false } = {}) {
@@ -45,76 +45,76 @@ function analyze(root, { keepAvd = 'apkstart.avd', aggressive = false, keepSnaps
   };
   const add = (p, size, reason, kind = 'file') => candidates.push({ path: p, size, reason, kind });
 
-  groupOf('emulator 引擎', path.join(root, 'emulator'));
-  groupOf('系统镜像（只读基础层）', path.join(root, 'system-images'));
-  groupOf('AVD 可写层 / 快照', path.join(root, 'avd'));
+  groupOf('emulator engine', path.join(root, 'emulator'));
+  groupOf('system image (read-only base layer)', path.join(root, 'system-images'));
+  groupOf('AVD writable layer / snapshot', path.join(root, 'avd'));
   groupOf('platform-tools', path.join(root, 'platform-tools'));
 
-  // 1) QEMU 只需要 x86_64 一个目标；包里另外 7 个架构的二进制纯属浪费
+  // 1) QEMU needs only the x86_64 target; the other seven architectures are pure waste
   const qemuDir = path.join(root, 'emulator', 'qemu', 'windows-x86_64');
   if (exists(qemuDir)) {
     for (const f of walk(qemuDir)) {
       if (/qemu-system-(aarch64|armel|i386)/i.test(path.basename(f.path))) {
-        add(f.path, f.size, '非 x86_64 的 QEMU 目标，运行时用不到');
+        add(f.path, f.size, 'non-x86_64 QEMU target, unused at runtime');
       }
     }
   }
 
-  // 2) 镜像包里的许可证文本 / 冗余目录
+  // 2) licence texts / redundant directories inside the image package
   for (const f of walk(path.join(root, 'system-images'))) {
     if (/^(NOTICE\.txt|source\.properties)$/i.test(path.basename(f.path)) && f.size > 1024 * 1024) {
-      add(f.path, f.size, '镜像包内的大体积说明文件');
+      add(f.path, f.size, 'large documentation file inside the image package');
     }
   }
 
-  // 3) 只保留一份系统镜像：API 34 Play 镜像就位后，API 30 的旧镜像全部过期
+  // 3) Keep one system image: once the API 34 Play image is in place, API 30 images are obsolete
   const play34 = path.join(root, 'system-images', 'android-34', 'google_apis_playstore', 'x86_64', 'system.img');
   if (exists(play34)) {
     const legacy = path.join(root, 'system-images', 'android-30');
-    if (exists(legacy)) add(legacy, dirSize(legacy), '旧版 API 30 镜像（含过时的 ARM 翻译层）', 'dir');
+    if (exists(legacy)) add(legacy, dirSize(legacy), 'old API 30 image (stale ARM translation layer)', 'dir');
   }
   const stray = path.join(root, 'x86_64');
-  if (exists(stray)) add(stray, dirSize(stray), '解压错位产生的重复镜像目录', 'dir');
+  if (exists(stray)) add(stray, dirSize(stray), 'duplicate image directory from a misplaced unpack', 'dir');
 
-  // 4) 非活动 AVD：产品只用 apkstart 一个；测试期遗留的 apkstart-arm / -houdini 等可清
+  // 4) Inactive AVDs: only 'apkstart' is used; test leftovers (apkstart-arm, -houdini) can go
   const avdHome = path.join(root, 'avd');
   if (exists(avdHome)) {
     for (const e of fs.readdirSync(avdHome, { withFileTypes: true })) {
       if (!e.isDirectory() || !e.name.endsWith('.avd') || e.name === keepAvd) continue;
       add(path.join(avdHome, e.name), dirSize(path.join(avdHome, e.name)),
-        '非活动 AVD（含 8-16GB 的旧用户数据镜像）', 'dir');
+        'inactive AVD (old userdata image of 8-16 GB)', 'dir');
     }
-    // 5) 锁文件：残留会导致「AVD is already running」
+    // 5) Lock files: leftovers cause 'AVD is already running'
     for (const f of walk(avdHome)) {
-      if (/\.lock$/i.test(f.path)) add(f.path, f.size, '上次异常退出残留的锁文件');
+      if (/\.lock$/i.test(f.path)) add(f.path, f.size, 'lock file left by an unclean exit');
     }
-    // 6) 快速启动快照：ram.img ≈ 分配给虚拟机的内存，损坏或配置变更后必须丢弃
+    // 6) Quickboot snapshot: ram.img ≈ the VM memory; must be dropped when corrupt or reconfigured
     const activeAvd = path.join(avdHome, keepAvd);
     if (exists(activeAvd) && !keepSnapshots) {
       for (const e of fs.readdirSync(activeAvd, { withFileTypes: true })) {
-        // 正常快照 + 删除失败时改名留下的旧快照，都可回收
+        // Both the normal snapshot and renamed ones left after a failed delete are reclaimable
         if (!e.isDirectory() || !/^snapshots(\.stale-\d+)?$/.test(e.name)) continue;
         const p = path.join(activeAvd, e.name);
-        add(p, dirSize(p), '旧 quickboot 快照（配置变更后会自动重建）', 'dir');
+        add(p, dirSize(p), 'old quickboot snapshot (rebuilt automatically after a config change)', 'dir');
       }
     }
   }
 
-  // 7) 下载缓存 / QEMU 遗留 ISO
+  // 7) Download cache / leftover QEMU ISOs
   for (const d of ['_tmp', 'images']) {
     const p = path.join(root, d);
     if (exists(p)) {
       const size = dirSize(p);
-      if (size > 0) add(p, size, d === '_tmp' ? '下载临时文件' : '旧的 QEMU/ISO 遗留文件', 'dir');
+      if (size > 0) add(p, size, d === '_tmp' ? 'temporary download files' : 'old QEMU/ISO leftovers', 'dir');
     }
   }
 
-  // 8) 激进裁剪：仅构建发行包时启用。
-  // 注意：Qt6WebEngineCoreAndroidEmu.dll 是 qemu-system-x86_64.exe 的加载时依赖，
-  // 实测删掉会直接起不来，绝不能放进清单；qsn/netsim 也可能被快照与网络功能按需调用，保守保留。
+  // 8) Aggressive trimming: release builds only.
+  // Qt6WebEngineCoreAndroidEmu.dll is a load-time dependency of qemu-system-x86_64 —
+  // removing it stops the emulator; qsn/netsim may be called by snapshots and networking, so keep them.
   if (aggressive) {
     const extras = [
-      ['emulator/crashreport.exe', '崩溃上报工具（无头运行不需要）'],
+      ['emulator/crashreport', 'crash reporter (not needed in normal runs)'],
     ];
     for (const [rel, reason] of extras) {
       const p = path.join(root, rel);
@@ -127,8 +127,8 @@ function analyze(root, { keepAvd = 'apkstart.avd', aggressive = false, keepSnaps
 }
 
 /**
- * 回收。必须显式传 apply:true；调用方（UI/构建脚本）负责先展示清单并取得确认。
- * 安全约束：任何目标都必须在 root 之内，且不允许把 root 自身删掉。
+ * Reclaim. Requires an explicit apply:true; the caller (UI/build script) shows the list first.
+ * Safety: every target must be inside root, and root itself can never be deleted.
  */
 function prune(root, { apply = false, keepAvd, aggressive = false, keepSnapshots = false, onRemove = () => {} } = {}) {
   const report = analyze(root, { keepAvd, aggressive, keepSnapshots });
@@ -145,26 +145,26 @@ function prune(root, { apply = false, keepAvd, aggressive = false, keepSnapshots
         removed.push(c);
         saved += c.size;
         onRemove(c);
-      } catch (_) { /* 占用中的文件跳过，下次再清 */ }
+      } catch (_) { /* busy file — skip, clean next time */ }
     }
   }
   return { ...report, apply, removed, saved, after: apply ? report.total - saved : report.total };
 }
 
-/** 给设置页用的简短摘要 */
+/** Short summary for the settings page */
 function summary(root) {
   const a = analyze(root);
   const mb = (n) => (n >= 1048576 * 1024
     ? `${(n / 1073741824).toFixed(2)} GB`
     : `${(n / 1048576).toFixed(0)} MB`);
-  // 除了运行时目录，用户最关心「这东西一共占了我多少盘」：
-  // AVD（应用数据 + 快照）、APK 缓存、图标、日志都算进来。
+  // Beyond the runtime directory, users care how much disk this takes overall:
+  // AVD (app data + snapshots), APK cache, icons and logs all count.
   const store = require('./store');
   const extra = [
-    { key: 'avd', label: '安卓数据（应用 + 快照）', path: path.join(store.DATA_DIR, 'avd') },
-    { key: 'apk', label: 'APK 安装包缓存', path: store.APK_DIR },
-    { key: 'icons', label: '桌面图标缓存', path: store.ICON_DIR },
-    { key: 'logs', label: '日志', path: path.join(store.DATA_DIR, 'logs') },
+    { key: 'avd', label: 'Android data (apps + snapshots)', path: path.join(store.DATA_DIR, 'avd') },
+    { key: 'apk', label: 'APK cache', path: store.APK_DIR },
+    { key: 'icons', label: 'icon cache', path: store.ICON_DIR },
+    { key: 'logs', label: 'logs', path: path.join(store.DATA_DIR, 'logs') },
   ].map((g) => ({ ...g, size: dirSize(g.path) })).filter((g) => g.size > 0);
 
   const extraTotal = extra.reduce((n, g) => n + g.size, 0);
@@ -174,7 +174,7 @@ function summary(root) {
     totalText: mb(totalAll),
     runtimeText: mb(a.total),
     groups: [
-      { key: 'runtime', label: '运行时（引擎 + 系统镜像）', size: a.total, text: mb(a.total) },
+      { key: 'runtime', label: 'runtime (engine + system image)', size: a.total, text: mb(a.total) },
       ...extra.map((g) => ({ ...g, text: mb(g.size) })),
     ],
     reclaimable: a.candidates.reduce((n, c) => n + c.size, 0),

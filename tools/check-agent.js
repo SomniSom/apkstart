@@ -1,5 +1,5 @@
 'use strict';
-// 临时验证：窗口代理脚本能编译、能连上、boothide 能下发
+// Quick check that the window agent starts and answers a probe
 const { WinAgent } = require('../src/core/agent');
 
 (async () => {

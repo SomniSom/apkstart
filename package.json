@@ -2,9 +2,9 @@
   "name": "apkstart",
   "productName": "ApkStart",
   "version": "0.4.4",
-  "description": "极致轻量的 Windows 安卓应用运行器：双击 APK 即装，应用以独立窗口与桌面图标运行",
+  "description": "Лёгкий запуск Android-приложений на Linux: двойной клик по APK → установка → отдельное окно приложения (Android Emulator + KVM)",
   "main": "src/main.js",
-  "author": "RoutineMiku",
+  "author": "RoutineMiku (upstream); Linux fork maintained in this repository",
   "license": "MIT",
   "private": true,
   "homepage": "https://github.com/RoutineMiku/apkstart#readme",
@@ -17,31 +17,34 @@
   },
   "keywords": [
     "android",
-    "emulator",
     "apk",
-    "windows",
-    "qemu",
+    "linux",
     "electron",
-    "wsa",
-    "freeform"
+    "adb",
+    "emulator",
+    "kvm",
+    "wayland",
+    "xdg"
   ],
   "engines": {
     "node": ">=20"
   },
   "os": [
-    "win32"
+    "linux"
   ],
   "scripts": {
     "start": "electron .",
     "dev": "electron . --dev",
     "test": "node test/run-tests.js && node test/engine-test.js && node test/auto-test.js",
     "pack": "node build/pack.js",
-    "runtime": "node build/prepare-runtime.js",
-    "build:exe": "node build/prepare-runtime.js && electron-builder --win nsis",
+    "build:deb": "node build/prepare-runtime.js && electron-builder --linux deb",
+    "build:appimage": "node build/prepare-runtime.js && electron-builder --linux AppImage",
+    "build:all": "node build/prepare-runtime.js && electron-builder --linux deb AppImage",
+    "build:fast": "electron-builder --linux deb AppImage",
     "selftest": "node scripts/selftest.js",
     "assoc:on": "node scripts/assoc.js on",
     "assoc:off": "node scripts/assoc.js off",
-    "test:boot": "node test/boot-test.js"
+    "check:deps": "node tools/check-linux.js"
   },
   "devDependencies": {
     "electron": "^33.4.11",

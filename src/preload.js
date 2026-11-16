@@ -73,7 +73,7 @@ contextBridge.exposeInMainWorld('apkstart', {
   removeSelf: () => invoke('app:removeSelf'),
   setSharedDir: (dir) => invoke('settings:setSharedDir', dir),
 
-  // 在线更新（GitHub Releases）
+  // Online update (GitHub Releases)
   updateCheck: (opts) => invoke('app:updateCheck', opts || {}),
   updateApply: () => invoke('app:updateApply'),
   updateCancel: () => invoke('app:updateCancel'),
@@ -94,7 +94,7 @@ contextBridge.exposeInMainWorld('apkstart', {
   winHide: () => invoke('window:hide'),
   bringAppToFront: () => invoke('app:foreground'),
 
-  // 应用窗口（只有 旋转 / 最小化 / 最大化 / 关闭）用到的接口
+  // App window API (rotate / minimize / maximize / close only)
   shell: {
     state: () => invoke('shell:state'),
     minimize: () => invoke('shell:minimize'),
@@ -110,7 +110,7 @@ contextBridge.exposeInMainWorld('apkstart', {
     },
   },
 
-  // 安卓系统设置（WiFi / 音量 / 显示 / 动画 / 权限 …）
+  // Android system settings (WiFi / volume / display / animations / permissions …)
   android: {
     status: () => invoke('android:status'),
     set: (key, value) => invoke('android:set', { key, value }),

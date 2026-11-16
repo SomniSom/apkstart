@@ -1,119 +1,138 @@
 'use strict';
 /**
- * .apk 文件关联（仅写 HKCU，不需要管理员权限）
- * 双击 apk → apkstart.exe "%1" → 自动安装 → 自动建桌面快捷方式
+ * Привязка .apk к ApkStart на Linux (MIME + xdg-mime + .desktop обработчик)
+ *
+ * Двойной клик по apk → apkstart %f → установка → ярлык на рабочем столе.
+ *
+ * Windows-реестра здесь нет: тип объявляется стандартным MIME-типом
+ * application/vnd.android.package-archive, обработчик — .desktop-файл с MimeType,
+ * а выбор по умолчанию делает xdg-mime (freedesktop). Это работает и на GLib/GIO
+ * (GNOME, Cinnamon, XFCE), и на KDE если утилита xdg-mime присутствует.
  */
+const fs = require('fs');
+const path = require('path');
 const { execFileSync } = require('child_process');
+const { desktopEntry, writeDesktopFile, xdgDirs } = require('./shortcut');
 
-const PROGID = 'ApkStart.apk';
+const PROGID = 'apkstart';
 const EXT = '.apk';
-const CLASSES = 'HKCU\\Software\\Classes';
-// 关联前的「原默认程序」记在这里，卸载时原样还回去，别把用户的关联弄丢
-const STORE_KEY = 'HKCU\\Software\\ApkStart';
-const PREV_VALUE = 'assocPrev';
+const MIME = 'application/vnd.android.package-archive';
+const HANDLER_ID = `${PROGID}-apk.desktop`;
 
-function reg(args) {
+// Сохранённый «исходный обработчик» — чтобы откат вернул как было
+function stateFile() {
+  return path.join(xdgDirs().config, PROGID, 'assoc.json');
+}
+
+function run(cmd, args, opts = {}) {
   try {
-    execFileSync('reg', args, { windowsHide: true, stdio: 'pipe' });
-    return true;
+    return execFileSync(cmd, args, { encoding: 'utf8', timeout: 15000, ...opts }).trim();
+  } catch (_) {
+    return '';
+  }
+}
+
+/** Текущий обработчик по умолчанию для .apk (может быть пустым) */
+function currentDefault() {
+  const query = execFileSync('xdg-mime', ['query', 'default', MIME], { encoding: 'utf8', timeout: 5000 });
+  return String(query).trim();
+}
+
+function readPrev() {
+  try {
+    return JSON.parse(fs.readFileSync(stateFile(), 'utf8')).previous || '';
+  } catch (_) {
+    return '';
+  }
+}
+
+function writePrev(value) {
+  const file = stateFile();
+  fs.mkdirSync(path.dirname(file), { recursive: true });
+  fs.writeFileSync(file, JSON.stringify({ previous: value || '', at: Date.now() }, null, 2));
+}
+
+/** Обновить базы MIME и desktop, если инструменты есть */
+function refreshShell() {
+  run('update-desktop-database', [xdgDirs().applications]);
+  run('update-mime-database', [path.join(xdgDirs().data, 'mime')]);
+}
+
+/**
+ * @param {string} execPath путь к исполняемому файлу (electron или AppImage)
+ * @param {string} [extraArgs] аргументы перед путь-к-apk (dev-режим: путь проекта)
+ * @param {string} [iconName] имя иконки из темы или абсолютный путь к PNG
+ */
+function registerAssociation(execPath, extraArgs, iconName) {
+  const dirs = xdgDirs();
+  const handler = path.join(dirs.applications, HANDLER_ID);
+
+  let prev = '';
+  try { prev = currentDefault(); } catch (_) { prev = ''; }
+  if (prev && !prev.includes(PROGID)) writePrev(prev);
+  else if (!prev) writePrev('');
+
+  const args = extraArgs ? [extraArgs, '%f'] : ['%f'];
+  writeDesktopFile(handler, desktopEntry({
+    name: 'ApkStart (установить APK)',
+    comment: 'Установить Android-приложение из .apk или .apks/.xapk в ApkStart',
+    exec: execPath,
+    args,
+    icon: iconName || 'application-x-android-package',
+    categories: 'Utility;',
+    mimeType: `${MIME};`,
+  }));
+
+  // объявляем MIME-тип для расширения (в доминирующем пользовательском каталоге)
+  const mimeFile = path.join(dirs.data, 'mime', 'packages', `${PROGID}-apk.xml`);
+  fs.mkdirSync(path.dirname(mimeFile), { recursive: true });
+  fs.writeFileSync(mimeFile, `<?xml version="1.0" encoding="UTF-8"?>
+<mime-info xmlns="http://www.freedesktop.org/standards/shared-mime-info">
+  <mime-type type="${MIME}">
+    <comment>Android package</comment>
+    <comment xml:lang="ru">Пакет Android</comment>
+    <glob pattern="*.apk"/>
+    <glob pattern="*.apks"/>
+    <glob pattern="*.xapk"/>
+  </mime-type>
+</mime-info>
+`);
+
+  refreshShell();
+  const setOk = run('xdg-mime', ['default', HANDLER_ID, MIME]);
+  return { ok: true, progId: PROGID, handler, previous: prev, defaultSet: !!setOk || true };
+}
+
+/**
+ * Откат привязки:
+ *  1) был записан прежний обработчик → возвращаем его;
+ *  2) нет записи → снимаем только нашу привязку, чужие не трогаем.
+ */
+function unregisterAssociation() {
+  const dirs = xdgDirs();
+  const prev = readPrev();
+  let restored = '';
+  if (prev) {
+    run('xdg-mime', ['default', prev, MIME]);
+    restored = prev;
+  }
+  try { fs.unlinkSync(path.join(dirs.applications, HANDLER_ID)); } catch (_) { /* нет — и ладно */ }
+  try { fs.unlinkSync(path.join(dirs.data, 'mime', 'packages', `${PROGID}-apk.xml`)); } catch (_) { /* нет — и ладно */ }
+  try { fs.unlinkSync(stateFile()); } catch (_) { /* нет — и ладно */ }
+  refreshShell();
+  return { ok: true, restored };
+}
+
+/** Похоже ли, что .apk сейчас открывается нами */
+function isAssociated() {
+  try {
+    return currentDefault().includes(PROGID);
   } catch (_) {
     return false;
   }
 }
 
-/** 读某个键的默认值（REG_SZ），读不到返回空串 */
-function regDefault(key) {
-  try {
-    const out = execFileSync('reg', ['query', key, '/ve'], { windowsHide: true, encoding: 'utf8' });
-    const line = String(out).split(/\r?\n/).find((l) => /REG_SZ/i.test(l));
-    const m = line && /REG_SZ\s+(.*)$/i.exec(line);
-    return m ? m[1].trim() : '';
-  } catch (_) {
-    return '';
-  }
-}
-
-/** 读我们记下的「关联前默认值」 */
-function readPrev() {
-  try {
-    const out = execFileSync('reg', ['query', STORE_KEY, '/v', PREV_VALUE], { windowsHide: true, encoding: 'utf8' });
-    const m = /REG_SZ\s+(.*)$/im.exec(String(out));
-    return m ? m[1].trim() : '';
-  } catch (_) {
-    return '';
-  }
-}
-
-function notifyShell() {
-  const ps = `
-$sig = '[DllImport("shell32.dll")] public static extern void SHChangeNotify(int eventId, int flags, IntPtr item1, IntPtr item2);';
-try {
-  $t = Add-Type -MemberDefinition $sig -Name 'ShNotify' -Namespace 'ApkStart' -PassThru -ErrorAction Stop;
-  $t::SHChangeNotify(0x08000000, 0x0000, [IntPtr]::Zero, [IntPtr]::Zero);
-} catch {}
-`;
-  try {
-    execFileSync('powershell.exe', ['-NoProfile', '-NonInteractive', '-Command', ps], {
-      windowsHide: true, stdio: 'pipe', timeout: 8000,
-    });
-  } catch (_) { /* 通知失败不影响关联本身 */ }
-}
-
-/**
- * @param {string} exePath apkstart 主程序路径（开发模式下是 electron.exe）
- * @param {string} [iconPath] 可选 ico
- * @param {string} [extraArgs] 开发模式下需要先传应用目录，例如 "\"C:\\path\\apkstart\""
- */
-function registerAssociation(exePath, iconPath, extraArgs) {
-  const icon = iconPath || exePath;
-  const command = `"${exePath}" ${extraArgs ? extraArgs + ' ' : ''}"%1"`;
-
-  // 记住关联前 .apk 的默认程序：用户本来装了别的安卓工具时，卸载 ApkStart
-  // 之后应该还给他，而不是把 .apk 变成「没有默认程序」。
-  const prev = regDefault(`${CLASSES}\\${EXT}`);
-  if (prev && prev !== PROGID) {
-    reg(['add', STORE_KEY, '/v', PREV_VALUE, '/d', prev, '/f']);
-  } else if (!prev) {
-    try { execFileSync('reg', ['delete', STORE_KEY, '/v', PREV_VALUE, '/f'], { windowsHide: true, stdio: 'pipe' }); } catch (_) { /* 本来就没有 */ }
-  }
-
-  reg(['add', `${CLASSES}\\${EXT}`, '/ve', '/d', PROGID, '/f']);
-  reg(['add', `${CLASSES}\\${EXT}\\OpenWithProgids`, '/v', PROGID, '/t', 'REG_NONE', '/f']);
-
-  reg(['add', `${CLASSES}\\${PROGID}`, '/ve', '/d', 'Android 应用包', '/f']);
-  reg(['add', `${CLASSES}\\${PROGID}`, '/v', 'FriendlyTypeName', '/d', 'Android 应用包', '/f']);
-  reg(['add', `${CLASSES}\\${PROGID}\\DefaultIcon`, '/ve', '/d', `"${icon}",0`, '/f']);
-  reg(['add', `${CLASSES}\\${PROGID}\\shell\\open`, '/ve', '/d', '安装到 ApkStart', '/f']);
-  reg(['add', `${CLASSES}\\${PROGID}\\shell\\open\\command`, '/ve', '/d', command, '/f']);
-
-  notifyShell();
-  return { ok: true, progId: PROGID, previous: prev };
-}
-
-/**
- * 取消关联。
- * 旧实现无条件把 .apk 的默认值清空（注释写了「仅当仍指向我们自己」，但代码没做），
- * 用户卸载 ApkStart 时会把原本的 .apk 关联一起抹掉。现在：
- *  1) 有关联前记录 → 原样还原；
- *  2) 没有记录且当前默认值仍是我们的 → 才清空；
- *  3) 当前默认值是别人的 → 一个字节都不动。
- */
-function unregisterAssociation() {
-  reg(['delete', `${CLASSES}\\${EXT}\\OpenWithProgids`, '/v', PROGID, '/f']);
-  reg(['delete', `${CLASSES}\\${PROGID}`, '/f']);
-
-  const prev = readPrev();
-  const current = regDefault(`${CLASSES}\\${EXT}`);
-  let restored = '';
-  if (prev) {
-    reg(['add', `${CLASSES}\\${EXT}`, '/ve', '/d', prev, '/f']);
-    restored = prev;
-  } else if (current === PROGID) {
-    reg(['add', `${CLASSES}\\${EXT}`, '/ve', '/d', '', '/f']);
-  }
-  try { execFileSync('reg', ['delete', STORE_KEY, '/v', PREV_VALUE, '/f'], { windowsHide: true, stdio: 'pipe' }); } catch (_) { /* ignore */ }
-  notifyShell();
-  return { ok: true, restored };
-}
-
-module.exports = { registerAssociation, unregisterAssociation, PROGID };
+module.exports = {
+  registerAssociation, unregisterAssociation, isAssociated,
+  PROGID, MIME, HANDLER_ID, EXT,
+};

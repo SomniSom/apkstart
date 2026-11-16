@@ -1,9 +1,9 @@
 #!/usr/bin/env node
 /**
- * 轻量 CDP 客户端（零依赖，Node 22+ 内置 WebSocket）。
- * 用于扫码登录后的浏览器发布自动化：列标签 / 导航 / 执行 JS / 截图 / 上传文件。
+ * Minimal CDP client (no dependencies; Node 22+ has a built-in WebSocket).
+ * Used for publishing automation after a QR login: list tabs / navigate / eval / screenshot / upload.
  *
- * 用法：
+ * Usage:
  *   node scripts/cdp.mjs list
  *   node scripts/cdp.mjs new <url>
  *   node scripts/cdp.mjs eval <target-match> "<js expression>"
@@ -11,7 +11,7 @@
  *   node scripts/cdp.mjs nav  <target-match> <url>
  *   node scripts/cdp.mjs upload <target-match> <css-selector> <file1> [file2...]
  *
- * <target-match> 是 url 或 title 的子串；省略时用第一个 page 标签。
+ * <target-match> is a substring of the url or title; omitted means the first page tab.
  */
 import fs from 'node:fs';
 import http from 'node:http';
@@ -39,7 +39,7 @@ async function pickTarget(match) {
   const all = await listTargets();
   if (!match) return all[0];
   const t = all.find((x) => (x.url || '').includes(match) || (x.title || '').includes(match));
-  if (!t) throw new Error(`未找到匹配标签: ${match}\n可用:\n${all.map((x) => `  ${x.url}`).join('\n')}`);
+  if (!t) throw new Error(`no matching target: ${match}\navailable:\n${all.map((x) => `  ${x.url}`).join('\n')}`);
   return t;
 }
 
@@ -65,7 +65,7 @@ class Cdp {
       setTimeout(() => {
         if (this.pending.has(id)) {
           this.pending.delete(id);
-          reject(new Error(`CDP 超时: ${method}`));
+          reject(new Error(`CDP timeout: ${method}`));
         }
       }, 30000);
     });
@@ -90,7 +90,7 @@ class Cdp {
   async upload(selector, files) {
     const doc = await this.send('DOM.getDocument', { depth: -1, pierce: true });
     const { nodeId } = await this.send('DOM.querySelector', { nodeId: doc.root.nodeId, selector });
-    if (!nodeId) throw new Error(`未找到文件输入框: ${selector}`);
+    if (!nodeId) throw new Error(`file input not found: ${selector}`);
     await this.send('DOM.setFileInputFiles', { files, nodeId });
     return true;
   }
@@ -103,7 +103,7 @@ async function attach(target) {
   const ws = new WebSocket(target.webSocketDebuggerUrl);
   await new Promise((resolve, reject) => {
     ws.onopen = resolve;
-    ws.onerror = (e) => reject(new Error('WebSocket 连接失败: ' + (e?.message || '')));
+    ws.onerror = (e) => reject(new Error('WebSocket connection failed: ' + (e?.message || '')));
   });
   return new Cdp(ws);
 }
@@ -164,7 +164,7 @@ async function main() {
     console.log('files set:', args.slice(2).length);
     return;
   }
-  throw new Error(`未知命令: ${cmd}`);
+  throw new Error(`unknown command: ${cmd}`);
 }
 
 main()

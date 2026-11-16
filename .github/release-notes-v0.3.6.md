@@ -1,61 +1,71 @@
 # ApkStart v0.3.6
 
-> 一句话：**修好了「红果点『同意并继续』后一直黑屏」**。真因是安卓虚拟机的 Wi-Fi 迟迟连不上、应用在没网时就加载首页，页面上只剩一块黑底 —— 和显卡、渲染后端无关。
+> One line: **fixed "black screen after tapping Agree and continue"**. The real cause was
+> the Android VM's Wi-Fi taking a long time to associate so the app rendered its home page
+> without a network and showed a black block — nothing to do with the GPU or the renderer.
 
-## 一、红果点「同意」后黑屏 —— 真因与修复
+## 1. Black screen after "Agree" — cause and fix
 
-### 上一版的误判
+### The previous release got it wrong
 
-v0.3.5 把黑屏归因到 GPU 后端（swangle / software），是**错的**。换后端当然没用。
+v0.3.5 blamed the GPU backend (swangle / software). That was **wrong**; switching backends
+of course did not help.
 
-### 这次实测定位到的真因
+### What adb actually showed
 
-用 adb 逐层查下来：
+- `cmd wifi status`: `Wifi is not connected`; `ip -o addr show wlan0`: **no address at all**;
+- so **the VM had no network at that moment**;
+- the privacy dialog is a local page, so it rendered fine; tapping "Agree and continue"
+  pulls home-page data, and without data the page renders as a black block — exactly what
+  the user sees;
+- `sys.boot_completed` only means the system is up; **Wi-Fi association + DHCP often need
+  another tens of seconds to two minutes**. The app started before the network, every
+  request failed and the page stayed black.
 
-- `cmd wifi status`：`Wifi is not connected`；`ip -o addr show wlan0`：**没有任何 IP**；
-- 也就是说**虚拟机当时没有网络**；
-- 红果的隐私弹窗是本地页面，所以正常显示；点「同意并继续」之后要拉首页数据，
-  拿不到数据就渲染成一整块黑底 —— 用户看到的就是「点同意后黑屏」；
-- 而 `sys.boot_completed` 只代表系统起来了，**Wi-Fi 关联 + DHCP 往往还要再等几十秒到两分多钟**。
-  应用启动得比网络就绪早，首页请求全部失败，页面就一直黑着。
+Evidence: immediately after boot the VM reports no address; a minute or two later
+`wlan0 inet 10.0.2.16/24` and `Wifi is connected to "AndroidWifi"` appear, and the home
+page renders normally.
 
-实测证据：同一个虚拟机，开机后立刻查是「无 IP」，等一两分钟后再查就变成
-`wlan0 inet 10.0.2.16/24` + `Wifi is connected to "AndroidWifi"`，此时红果首页完全正常。
+### What this release does
 
-### 本版修复
+1. **Wait for the network before launching**: `installer.launch` waits up to 150 s before
+   `am start`, logging `waiting for the Android VM network... Ns`, so the app can no
+   longer start before the network.
+2. **Post-boot network check**: after a successful boot the VM's address is checked and,
+   when missing, the reason is written to the log instead of leaving the user guessing.
+3. **Settings -> Repair network** (new button): resets the Android user data, reboots and
+   waits for the network (up to 4 minutes), then saves the working state as a quickboot
+   snapshot.
+   - **The app list is kept**; apps are reinstalled on launch, no manual APK reinstall;
+   - in-app accounts and watch history are lost and must be re-created;
+   - only the current AVD is affected; the system image and the local APK cache stay.
 
-1. **拉起应用前先等网络就绪**：`installer.launch` 会在 `am start` 之前最多等 150 秒，
-   日志里会打 `正在等待安卓虚拟机联网… Ns`，就绪后才真正启动应用 —— 从根上避免
-   「应用比网络先跑起来」导致的黑屏。
-2. **启动后网络体检**：开机成功就检查虚拟机有没有拿到 IP，没网时日志里明确写出原因，
-   不再让用户对着黑屏猜。
-3. **设置 → 修复网络**（新按钮）：一键修复。做法是重置安卓用户数据并重新开机，
-   然后一直等到网络就绪（最长 4 分钟），成功后再把「网络正常」的状态存成快速启动快照。
-   - **应用清单会保留**，点开应用会自动重装，不用手动重装 APK；
-   - 应用内的登录态、追剧记录等运行时数据会丢失，需要重新登录；
-   - 只影响当前 AVD，系统镜像和本机 APK 缓存都不动。
+> If the app is black now: just open it (this release waits for the network first), and if
+> it is still black use Settings -> Repair network.
 
-> 红果现在黑屏的话：先直接点开红果试试（本版会自动等网络）；仍黑再点「设置 → 修复网络」。
+## 2. The previous "cache cleanup" fix stays
 
-## 二、上一版「清理缓存」修复继续生效
+The `includeSnapshots` + "reset Android data" logic from v0.3.5 is unchanged.
 
-v0.3.5 的 `includeSnapshots` + 「重置安卓数据」未改动，继续可用。
+## 3. Known limitations
 
-## 三、已知限制
+- The Android 14 (`google_apis_playstore`) image has an upstream issue: cold-booting on
+  **existing user data** often leaves Wi-Fi at `NO-CARRIER` with no address, while the
+  first boot after a data reset connects normally. "Repair network" therefore resets the
+  data and saves a snapshot right away to keep the working state.
+- The Play Store image does not allow `adb root`, so the broken Wi-Fi profile cannot be
+  deleted on its own.
 
-- 该 Android 14（`google_apis_playstore`）镜像存在上游问题：在**已有用户数据**上冷启动时，
-  Wi-Fi 经常一直 `NO-CARRIER`、拿不到 IP；重置数据后的那次开机则能正常连上。
-  因此「修复网络」会重置数据，并立刻存快照来保住可用状态。
-- Play Store 镜像不允许 `adb root`，无法单独删掉坏掉的 Wi-Fi 配置。
+## 4. Verified
 
-## 四、实测记录
+- After the fix, tapping "Agree and continue" reaches the app's main activity and the home
+  page shows the catalogue and recommendations (confirmed by screenshot, not black).
+- The same VM after the network is ready: `wlan0 inet 10.0.2.16/24`,
+  `Wifi is connected to "AndroidWifi"`.
+- `npm test`: **113 checks passed** (8 + 25 + 80).
 
-- 修复后：点「同意并继续」→ 进入 `MainFragmentActivity`，首页正常显示剧集列表与推荐流
-  （截图确认，非黑屏）。
-- 同一虚拟机等待网络就绪后：`wlan0 inet 10.0.2.16/24`、`Wifi is connected to "AndroidWifi"`。
-- `npm test`：**113 项全部通过**（8 + 25 + 80）。
+## 5. Upgrading
 
-## 五、升级方式
-
-- 便携版：解压覆盖，数据目录（默认 `%APPDATA%\apkstart`）保持不变。
-- 安装版：直接安装覆盖。
+- Portable: unpack over the old copy; the data directory (`~/.local/share/apkstart` by
+  default) is untouched.
+- Installed build: install over the old version.

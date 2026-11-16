@@ -1,15 +1,15 @@
 'use strict';
 /**
- * Windows 窗口代理：与 src/core/win/agent.ps1 里的常驻进程通信。
+ * Window agent: talks to the long-lived helper (Windows-only module, not used on Linux).
  *
- * 为什么不是每次 spawn 一个 PowerShell：窗口跟随鼠标拖动时会频繁改尺寸，
- * 每次起一个 powershell.exe 要 150~300ms，拖动就会一顿一顿的。
- * 这里只启动一次，之后走本机回环 TCP（一行一个 JSON），单次往返 <2ms。
+ * Why not spawn a helper per call: resizing while dragging takes many round trips,
+ * and each spawn costs 150-300 ms, which makes dragging stutter.
+ * The agent starts once and then speaks over loopback TCP (one JSON per line), under 2 ms per round trip.
  *
- * 代理可选负责 WH_MOUSE_LL 鼠标钩子：右键返回 / 滚轮滑动 / 侧键前进后退。
- * 该钩子是全局的，会介入系统里每一次鼠标事件，因此只在「应用窗口处于前台」
- * 且至少启用一项映射时安装，失焦立即卸载；回调只处理我们关心的 7 个消息。
- * 见 setHook(on, opts)。
+ * The agent may also own a WH_MOUSE_LL hook: right-click Back / wheel scroll / side buttons.
+ * The hook is global and sees every mouse event, so it is installed only while the app window
+ * is focused and at least one mapping is on; it is removed on blur and handles 7 messages.
+ * See setHook(on, opts).
  */
 const { spawn } = require('child_process');
 const net = require('net');
@@ -36,11 +36,11 @@ class WinAgent extends EventEmitter {
 
   get available() { return process.platform === 'win32' && fs.existsSync(SCRIPT); }
 
-  /** 启动代理并等到 TCP 连上（幂等） */
+  /** Start the agent and wait for TCP (idempotent) */
   ensure() {
     if (this.ready) return this.ready;
     this.ready = new Promise((resolve, reject) => {
-      if (!this.available) { reject(new Error('窗口代理不可用')); return; }
+      if (!this.available) { reject(new Error('Window agent unavailable')); return; }
       let out = '';
       let settled = false;
       const proc = spawn('powershell.exe', [
@@ -73,11 +73,11 @@ class WinAgent extends EventEmitter {
         this.ready = null;
         this.hooked = false;
         this.hookConf = null;
-        this._failAll('窗口代理已退出');
+        this._failAll('Window agent exited');
         if (wasReady) this.emit('exit');
-        fail(new Error('窗口代理启动失败'));
+        fail(new Error('Window agent failed to start'));
       });
-      setTimeout(() => { if (!settled) fail(new Error('窗口代理启动超时')); }, 15000);
+      setTimeout(() => { if (!settled) fail(new Error('Window agent start timed out')); }, 15000);
     });
     return this.ready;
   }
@@ -92,7 +92,7 @@ class WinAgent extends EventEmitter {
       sock.on('close', () => {
         this.sock = null;
         this.ready = null;
-        this._failAll('窗口代理连接断开');
+        this._failAll('Window agent connection closed');
       });
       this.sock = sock;
       this.buf = '';
@@ -108,7 +108,7 @@ class WinAgent extends EventEmitter {
       if (!line) continue;
       let msg = null;
       try { msg = JSON.parse(line); } catch (_) { continue; }
-      // 事件带负载（滚轮的 dx/dy/nx/ny），老监听器忽略多余参数即可
+      // Events carry a payload (wheel dx/dy/nx/ny); older listeners ignore extra args
       if (msg.ev) { this.emit(msg.ev, msg); continue; }
       const p = this.pending.shift();
       if (p) { clearTimeout(p.timer); p.resolve(msg); }
@@ -124,27 +124,27 @@ class WinAgent extends EventEmitter {
     }
   }
 
-  /** 发送一条命令并等待回包 */
+  /** Send one command and wait for the reply */
   async call(obj, timeout = CALL_TIMEOUT) {
     await this.ensure();
-    if (!this.sock) throw new Error('窗口代理未连接');
+    if (!this.sock) throw new Error('Window agent not connected');
     return new Promise((resolve, reject) => {
-      const timer = setTimeout(() => reject(new Error(`窗口代理超时: ${obj.cmd}`)), timeout);
+      const timer = setTimeout(() => reject(new Error(`Window agent timeout: ${obj.cmd}`)), timeout);
       this.pending.push({ resolve, reject, timer });
       this.sock.write(`${JSON.stringify(obj)}\n`);
     });
   }
 
-  // ---------------- 便捷方法 ----------------
+  // ---------------- convenience methods ----------------
 
   /**
-   * 声明「哪些目录里的进程才算我们的」。
-   * 必须在 bootHide / embed 之前调用：窗口代理只允许碰这些进程创建的窗口。
-   * 不传（或传空）时代理一个窗口都不动 —— 宁可偶尔漏一个黑窗，
-   * 也绝不把别的 Qt 应用（微信 4.x 就是 Qt6、MuMu、音乐播放器）的窗口藏掉或嵌进来。
-   * @param {string[]} dirs 运行时根目录 / 随包的 engine 目录
-   * @param {number} [appPid] 主进程 pid：代理只允许把窗口嵌进这个进程的窗口，
-   *        并以此为据决定「鼠标事件的当前窗口是不是我们的」（防止句柄被回收复用）
+   * Declare whose processes count as ours.
+   * Must be called before bootHide / embed: the agent only touches windows of these processes.
+   * Empty (or omitted) means it never moves a window — better an occasional stray console
+   * than hiding or embedding another Qt app (messengers, players) by mistake.
+   * @param {string[]} dirs runtime root / bundled engine directory
+   * @param {number} [appPid] main process pid: the agent may only embed into this process,
+   *        and uses it to decide whether a mouse event belongs to us (guards handle reuse)
    */
   async scope(dirs, appPid) {
     const list = (Array.isArray(dirs) ? dirs : [dirs]).filter(Boolean);
@@ -153,7 +153,7 @@ class WinAgent extends EventEmitter {
     return this.call(req, 4000).catch(() => ({ ok: false, n: 0 }));
   }
 
-  /** 把模拟器窗口嵌进宿主窗口，并摆到 x,y,w,h（宿主客户区坐标） */
+  /** Embed the emulator window into the host window at x,y,w,h (client coords) */
   async embed(hostHwnd, rect) {
     return this.call({
       cmd: 'embed', host: String(hostHwnd),
@@ -167,8 +167,8 @@ class WinAgent extends EventEmitter {
       cmd: 'fit',
       x: Math.round(rect.x), y: Math.round(rect.y),
       w: Math.round(rect.w), h: Math.round(rect.h),
-      // 模拟器 Qt 窗口比 LCD 多出 EMU_PAD 的外框，我们让它向上/向左溢出把这个外框
-      // 挤出客户区；溢出到标题栏上的那一条会被裁掉（否则点标题栏按钮时会冒黑边）。
+      // The Qt window has an EMU_PAD frame around the LCD; overflow it up/left to push the frame
+      // outside the client area, then clip the strip over the titlebar.
       clipTop: Math.round(rect.clipTop || 0),
     }, 3000);
   }
@@ -176,18 +176,18 @@ class WinAgent extends EventEmitter {
   async rotate(dir = 'left') { return this.call({ cmd: 'rotate', dir }, 8000); }
   async hide() { return this.call({ cmd: 'hide' }, 3000); }
   async show() { return this.call({ cmd: 'show' }, 3000); }
-  /** 通知代理进入低延迟模式：大幅降低窗口扫描频率，把 CPU 留给安卓渲染 */
+  /** Put the agent in low-latency mode: scan windows far less often, leave CPU to Android */
   async setPerformanceMode(on) { return this.call({ cmd: 'perf', on: on ? 1 : 0 }, 3000); }
   async detach() { return this.call({ cmd: 'detach' }, 5000); }
   async probe() { return this.call({ cmd: 'probe' }, 4000); }
-  /** 列出当前可见的顶层窗口（用于验证「只有软件界面 / 只有安卓应用窗口」） */
+  /** List visible top-level windows (to verify the window set) */
   async windows() { return this.call({ cmd: 'windows' }, 4000); }
 
   /**
-   * 把头号可疑窗口「摘下 + 藏好」。
-   * 宿主窗口销毁前必须调用：Windows 会在父窗口销毁时把跨进程的子窗口重新挂到桌面，
-   * 并保持它原来的可见状态 —— 桌面上凭空多出来的 Android Emulator 黑窗就是这么来的。
-   * 代理很忙（可能在编译 C#）时也不能拖着不关窗，所以这里给 700ms 硬上限。
+   * Detach and hide the prime suspect window.
+   * Must run before the host window is destroyed: the OS re-parents cross-process child windows
+   * to the desktop with their old visibility — that is where stray emulator windows come from.
+   * A busy agent must not delay closing, hence the hard 700 ms cap.
    */
   async park(maxWaitMs = 700) {
     const call = this.call({ cmd: 'park' }, 2000).catch(() => ({ ok: false }));
@@ -199,14 +199,13 @@ class WinAgent extends EventEmitter {
   }
 
   /**
-   * 开启「常驻压制」：模拟器主窗（QWindowIcon）+ 工具栏 + qemu / netsimd 的控制台黑窗
-   * 一律不允许露面，只有被 embed 进我们窗口的那一个除外。
-   * 这是「打开软件只看到软件界面」的关键：emulator 拉起 detached 的 qemu / netsimd
-   * 控制台子进程，Node 的 windowsHide 覆盖不到它们，只能由窗口代理周期性压住。
-   * 现在模拟器还带 -qt-hide-window（窗口创建即隐藏），双保险，连第一帧都不会闪。
+   * Enable permanent suppression: the emulator main window, its toolbar and the qemu / netsimd
+   * consoles must never show, except the one embedded into our window.
+   * This is what makes 'open the app, see only the app' work: the emulator detaches qemu / netsimd
+   * consoles that Node's windowsHide cannot reach, so the agent hides them periodically.
    *
-   * maxWaitMs：代理本身要现编译启动（几百毫秒，异常时可能十几秒）。调用点是在
-   * 「拉起模拟器之前」，绝不能因为代理起不来把开机拖住，所以这里给个硬上限。
+   * maxWaitMs: the agent itself may need to start (hundreds of ms, longer in bad cases).
+   * Called before the emulator starts, so a hard cap keeps boot from stalling.
    * @param {number} maxWaitMs
    */
   async bootHide(maxWaitMs = 3000) {
@@ -218,15 +217,15 @@ class WinAgent extends EventEmitter {
     ]);
   }
 
-  /** 关掉常驻压制（正常情况下不再需要：嵌入后压制会自动跳过被嵌入的那个窗口） */
+  /** Turn suppression off (usually unnecessary: it skips the embedded window) */
   async bootShow() {
     return this.call({ cmd: 'boothide', on: 0 }, 4000).catch(() => ({ ok: false }));
   }
 
   /**
-   * 全局鼠标钩子开关（幂等）。
-   * 只在应用窗口前台、且至少一项映射开启时才安装；opts 变化时不重装线程，
-   * 只把新开关发给常驻代理，避免窗口反复 focus / 改设置时反复装卸钩子。
+   * Global mouse hook switch (idempotent).
+   * Installed only with the app window focused and at least one mapping on; option changes
+   * update the agent instead of reinstalling the hook thread on every focus change.
    * @param {boolean} on
    * @param {{rightBack?:boolean, wheel?:boolean, side?:boolean}} opts
    */
@@ -237,7 +236,7 @@ class WinAgent extends EventEmitter {
       wheel: !!(opts && opts.wheel),
       side: !!(opts && opts.side),
     };
-    // 默认关闭状态下不为了「关」而拉起 PowerShell 进程（冷启动零开销）
+    // Do not start the helper just to switch something off (zero cold-start cost)
     if (!want && !this.hooked) return { ok: true, hooked: false };
     const sameConf = this.hookConf
       && this.hookConf.right === conf.right
@@ -257,7 +256,7 @@ class WinAgent extends EventEmitter {
   }
 
   dispose() {
-    // 先卸载全局钩子再结束进程：即使代理被强杀，也不给系统留残留钩子
+    // Remove the hook before exiting so a kill never leaves a stale hook
     if (this.hooked && this.sock) {
       try { this.sock.write('{"cmd":"hook","on":0}\n'); } catch (_) { /* ignore */ }
     }
@@ -265,10 +264,9 @@ class WinAgent extends EventEmitter {
     this.hookConf = null;
     try { this.sock?.end(); } catch (_) { /* ignore */ }
     try { this.sock?.destroy(); } catch (_) { /* ignore */ }
-    // 故意不 kill 代理进程：断开连接后它会自己进入「守卫」状态（见 agent.ps1 的
-    // _lingerUntil）。模拟器可能还在开机，几十秒后才把窗口显示出来；那时如果
-    // 代理已经死了，桌面上就会留一个 Android Emulator 黑窗。模拟器进程消失后
-    // 代理会自行退出，最多守 3 分钟。
+    // The agent process is deliberately not killed: after the disconnect it guards
+    // (see _lingerUntil in agent.ps1). The emulator may still be booting and show its window
+    // tens of seconds later; a dead agent would leave a stray window. It exits by itself.
     this.sock = null;
     this.proc = null;
     this.ready = null;

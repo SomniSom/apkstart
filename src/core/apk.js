@@ -1,7 +1,7 @@
 'use strict';
 /**
- * APK 元信息提取：包名 / 版本 / 应用名 / 启动 Activity / 图标 / ABI
- * 全部离线完成，不需要 aapt、不需要 adb、不需要联网。
+ * APK metadata extraction: package / version / label / launch activity / icon / ABI
+ * Fully offline: no aapt, no adb, no network.
  */
 const fs = require('fs');
 const { ZipFile } = require('./zip');
@@ -24,7 +24,7 @@ function isLauncherActivity(node) {
 }
 
 function pickIconFromZip(zip) {
-  // 兜底：在 res/ 里找最大的、名字像图标的位图（png / webp / jpg 都认）
+  // Fallback: the largest icon-looking bitmap under res/ (png / webp / jpg)
   const candidates = zip.names().filter((n) => /^res\/.*\.(png|webp|jpe?g)$/i.test(n));
   const scored = candidates.map((n) => {
     const e = zip.entries.get(n);
@@ -48,7 +48,7 @@ function pickIconFromZip(zip) {
 
 const IMG_RE = /\.(png|webp|jpe?g)$/i;
 
-/** 取节点上的 drawable / src 引用，还原成 APK 内的文件路径 */
+/** Take a drawable / src reference from a node and resolve it to a path inside the APK */
 function drawableFileOf(node, res) {
   for (const name of ['drawable', 'src']) {
     const a = attr(node, name);
@@ -64,10 +64,10 @@ function drawableFileOf(node, res) {
 }
 
 /**
- * 在图标 XML 的节点树里找可用位图。深度优先、XML 最多再展开 3 层：
- * 现代图标常见 `<adaptive-icon><foreground><inset><drawable/></inset></foreground>`，
- * 或者 `<layer-list><item><bitmap android:src="@drawable/x"/></item></layer-list>`，
- * 只认一层属性会直接落到「品牌占位图」。
+ * Find a usable bitmap in the icon XML tree. Depth-first, expanding at most 3 levels:
+ * Modern icons often look like `<adaptive-icon><foreground><inset><drawable/></inset></foreground>`
+ * or `<layer-list><item><bitmap android:src="@drawable/x"/></item></layer-list>`,
+ * so looking one level deep lands on the brand placeholder.
  */
 function iconFromNode(zip, node, res, depth = 0) {
   const file = drawableFileOf(node, res);
@@ -88,7 +88,7 @@ function iconFromNode(zip, node, res, depth = 0) {
   return null;
 }
 
-/** 从自适应图标 / layer-list 的 XML 里找出可用的前景/背景位图 */
+/** Pick the foreground/background bitmap from adaptive-icon / layer-list XML */
 function iconFromXml(zip, xmlBuffer, res, depth = 0) {
   let root;
   try {
@@ -96,26 +96,26 @@ function iconFromXml(zip, xmlBuffer, res, depth = 0) {
   } catch (_) {
     return null;
   }
-  // 先按规范顺序找 foreground → background → monochrome
+  // First the canonical order: foreground → background → monochrome
   for (const key of ['foreground', 'background', 'monochrome']) {
     const node = root.children.find((c) => c.name === key) || (root.name === key ? root : null);
     if (!node) continue;
     const hit = iconFromNode(zip, node, res, depth);
     if (hit) return hit;
   }
-  // 再整棵树扫一遍（layer-list / bitmap / inset 这类没有固定子节点名的）
+  // Then scan the whole tree (layer-list / bitmap / inset have no fixed child names)
   return iconFromNode(zip, root, res, depth);
 }
 
 /**
- * 解析一个 APK 的元信息。
- * 走文件版 ZIP 读取器（只读中央目录 + 按需读条目），因此**不把整个 APK 读进内存**：
- * 旧版 fs.readFileSync 整包读会让 2GB 以上的安装包直接失败（Node 单 Buffer 上限），
- * 低内存机器上大包也容易被 OOM 打断。
+ * Parse the metadata of one APK.
+ * Uses the file-based ZIP reader (central directory + entries on demand), so no full APK in RAM:
+ * the old readFileSync approach failed on packages above 2 GB (Node Buffer cap)
+ * and large packages were OOM-killed on small machines.
  */
 function parseApk(filePath) {
   const stat = fs.statSync(filePath);
-  if (stat.size < 1024) throw new Error('文件过小，不是有效的 APK');
+  if (stat.size < 1024) throw new Error('File too small to be a valid APK');
   const zip = new ZipFile(filePath);
   try {
     return parseApkZip(zip, filePath, stat);
@@ -124,19 +124,19 @@ function parseApk(filePath) {
   }
 }
 
-/** parseApk 的主体：调用方负责关闭 zip */
+/** parseApk body: the caller closes the zip */
 function parseApkZip(zip, filePath, stat) {
   if (!zip.has('AndroidManifest.xml')) {
-    throw new Error('缺少 AndroidManifest.xml：这不是单个 APK（可能是 .apks/.xapk 拆分包）');
+    throw new Error('AndroidManifest.xml missing: not a single APK (maybe a .apks/.xapk bundle)');
   }
 
   const manifestBuf = zip.read('AndroidManifest.xml');
   const manifest = parseAxml(manifestBuf);
 
-  // package 是 manifest 上的**非命名空间**属性（ns=''），必须按「任意命名空间」找：
-  // attrValue 默认只认 android 命名空间，传 null 表示不限定命名空间。
+  // package is a NON-namespaced attribute on <manifest> (ns=''), so search any namespace:
+  // attrValue defaults to the android namespace; null means any namespace.
   const packageName = attrValue(manifest, 'package', null);
-  if (!packageName) throw new Error('清单中未找到 package 名');
+  if (!packageName) throw new Error('No package name in the manifest');
 
   const versionName = attrValue(manifest, 'versionName') || '1.0';
   const versionCodeRaw = attrValue(manifest, 'versionCode');
@@ -148,13 +148,13 @@ function parseApkZip(zip, filePath, stat) {
 
   const app = children(manifest, 'application')[0] || { children: [], attrs: [] };
 
-  // ---- 资源表（用于解析 @0x7f 引用）----
+  // ---- resource table (for @0x7f references) ----
   let res = null;
   if (zip.has('resources.arsc')) {
     try { res = new ResTable(zip.read('resources.arsc')); } catch (_) { res = null; }
   }
 
-  // ---- 应用名 ----
+  // ---- app label ----
   let label = null;
   const labelAttr = attr(app, 'label');
   if (labelAttr) {
@@ -166,7 +166,7 @@ function parseApkZip(zip, filePath, stat) {
     label = label.charAt(0).toUpperCase() + label.slice(1);
   }
 
-  // ---- 启动 Activity ----
+  // ---- launch activity ----
   let launchActivity = null;
   const acts = children(app, 'activity').concat(children(app, 'activity-alias'));
   const launcher = acts.find(isLauncherActivity);
@@ -183,7 +183,7 @@ function parseApkZip(zip, filePath, stat) {
     }
   }
 
-  // ---- 图标 ----
+  // ---- icon ----
   let icon = null;
   const iconAttr = attr(app, 'icon') || attr(app, 'roundIcon');
   if (iconAttr) {
@@ -201,7 +201,7 @@ function parseApkZip(zip, filePath, stat) {
   }
   if (!icon) icon = pickIconFromZip(zip);
 
-  // ---- ABI（判断 x86 运行时能否直接跑 ARM 原生库）----
+  // ---- ABIs (can the x86 runtime run ARM native libs directly?) ----
   const abis = [...new Set(zip.names()
     .filter((n) => n.startsWith('lib/'))
     .map((n) => n.split('/')[1])
@@ -224,7 +224,7 @@ function parseApkZip(zip, filePath, stat) {
   };
 }
 
-/** 轻量校验：只看头部是不是 PK\x03\x04 */
+/** Cheap check: does it start with PK\x03\x04 */
 function quickCheck(filePath) {
   try {
     const fd = fs.openSync(filePath, 'r');

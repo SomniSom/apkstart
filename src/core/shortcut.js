@@ -1,175 +1,153 @@
 'use strict';
 /**
- * 桌面快捷方式 + 多尺寸 ICO 生成
+ * Рабочий стол: ярлыки .desktop + PNG-иконки (Linux)
  *
- * ICO 直接用 Electron nativeImage 缩放并手写 ICO 容器（DIB 格式，全 Windows 版本兼容），
- * 不依赖任何第三方图像库，也不需要 ImageMagick。
+ * На Linux ярлык — это текстовый файл .desktop (freedesktop.org Desktop Entry),
+ * and the icon is a plain PNG in the application directory. ICO/MS shell entries are gone:
+ * убирая их, мы избавляемся от Electron shell.writeShortcutLink и от всей
+ * Windows-only цепочки DIB/ICO, которая на Linux просто не выполнится.
  */
 const fs = require('fs');
 const path = require('path');
+const os = require('os');
 
-const ICO_SIZES = [16, 20, 24, 32, 40, 48, 64, 128, 256];
+const ICON_SIZES = [16, 22, 24, 32, 48, 64, 128, 256];
 
-function buildDib(bgra, size) {
-  const header = Buffer.alloc(40);
-  header.writeUInt32LE(40, 0);           // biSize
-  header.writeInt32LE(size, 4);          // biWidth
-  header.writeInt32LE(size * 2, 8);      // biHeight = XOR + AND
-  header.writeUInt16LE(1, 12);           // biPlanes
-  header.writeUInt16LE(32, 14);          // biBitCount
-  header.writeUInt32LE(0, 16);           // BI_RGB
-  header.writeUInt32LE(size * size * 4, 20);
+/** Имя файла без запрещённых в путях символов (совместимо с файловыми системами Linux) */
+function safeFileName(name) {
+  return String(name)
+    .replace(/[/\u0000:*?"<>|\\]/g, '_')
+    .replace(/\s+/g, ' ')
+    .trim()
+    .slice(0, 60) || 'Android App';
+}
 
-  // XOR 位图：自下而上，行内 BGRA
-  const xor = Buffer.alloc(size * size * 4);
-  for (let y = 0; y < size; y++) {
-    const srcRow = (size - 1 - y) * size * 4;
-    bgra.copy(xor, y * size * 4, srcRow, srcRow + size * 4);
-  }
-  // AND 掩码：1bpp，行按 4 字节对齐，全 0（交给 alpha 通道）
-  const maskRow = Math.ceil(size / 32) * 4;
-  const mask = Buffer.alloc(maskRow * size, 0);
-  return Buffer.concat([header, xor, mask]);
+/** Ссылочная строка Exec: экранируем строку по спецификации Desktop Entry */
+function execQuote(arg) {
+  const s = String(arg == null ? '' : arg);
+  // в поле Exec служебные символы экранируются обратным слешем, а % — как %%
+  return `"${s.replace(/\\/g, '\\\\').replace(/"/g, '\\"').replace(/\$/g, '\\$')
+    .replace(/`/g, '\\`').replace(/%/g, '%%')}"`;
+}
+
+function desktopEscape(value) {
+  return String(value == null ? '' : value)
+    .replace(/\\/g, '\\\\')
+    .replace(/\r?\n/g, '\\n')
+    .replace(/\t/g, '\\t');
 }
 
 /**
- * @param {Buffer} pngBuffer 任意尺寸的 PNG
- * @returns {Buffer|null} ICO 文件内容
+ * Собрать содержимое .desktop файла.
+ * @param {object} opt { name, exec, args, icon, comment, categories, terminal, startupWMClass, mimeType }
  */
-function pngToIco(pngBuffer) {
+function desktopEntry(opt) {
+  const exec = [execQuote(opt.exec)]
+    .concat((opt.args || []).filter((a) => a !== '').map(execQuote))
+    .join(' ');
+  const lines = [
+    '[Desktop Entry]',
+    'Type=Application',
+    'Version=1.5',
+    `Name=${desktopEscape(opt.name || 'Android App')}`,
+    `Comment=${desktopEscape(opt.comment || '')}`,
+    `Exec=${exec}`,
+    opt.icon ? `Icon=${opt.icon}` : null,
+    opt.terminal ? 'Terminal=true' : 'Terminal=false',
+    `Categories=${opt.categories || 'Utility;'}`,
+    opt.startupWMClass ? `StartupWMClass=${opt.startupWMClass}` : null,
+    opt.mimeType ? `MimeType=${opt.mimeType}` : null,
+    'StartupNotify=true',
+  ].filter(Boolean);
+  return `${lines.join('\n')}\n`;
+}
+
+/**
+ * Записать .desktop и сделать его исполняемым.
+ * GNOME/Nautilus требуют бит +x и доверие пользователя (gio set metadata::trusted),
+ * поэтому после записи пробуем пометить файл доверенным, но не падаем, если не вышло.
+ */
+function writeDesktopFile(filePath, content) {
+  const dir = path.dirname(filePath);
+  fs.mkdirSync(dir, { recursive: true });
+  const tmp = `${filePath}.tmp-${process.pid}`;
+  fs.writeFileSync(tmp, content, { mode: 0o755 });
+  fs.chmodSync(tmp, 0o755);
+  fs.renameSync(tmp, filePath);
+  try {
+    const { execFileSync } = require('child_process');
+    execFileSync('gio', ['set', filePath, 'metadata::trusted', 'true'], {
+      stdio: 'ignore', timeout: 3000,
+    });
+  } catch (_) { /* нет gio / другой DE — не критично */ }
+  return filePath;
+}
+
+/** Обновить кэш меню приложений, если инструмент установлен */
+function updateDesktopDatabase() {
+  const dirs = [
+    path.join(os.homedir(), '.local', 'share', 'applications'),
+    '/usr/local/share/applications',
+  ];
+  const { execFile } = require('child_process');
+  for (const d of dirs) {
+    if (!fs.existsSync(d)) continue;
+    execFile('update-desktop-database', [d], { timeout: 8000 }, () => {});
+  }
+}
+
+/** Пути стандартных каталогов пользователя (XDG) */
+function xdgDirs() {
+  const home = os.homedir();
+  const config = process.env.XDG_CONFIG_HOME || path.join(home, '.config');
+  const data = process.env.XDG_DATA_HOME || path.join(home, '.local', 'share');
+  let desktop = path.join(home, 'Desktop');
+  try {
+    const { execFileSync } = require('child_process');
+    const out = execFileSync('xdg-user-dir', ['DESKTOP'], { encoding: 'utf8', timeout: 3000 }).trim();
+    if (out && out !== home) desktop = out;
+  } catch (_) {
+    try {
+      const userDirs = fs.readFileSync(path.join(config, 'user-dirs.dirs'), 'utf8');
+      const m = /^XDG_DESKTOP_DIR="(.+)"$/m.exec(userDirs);
+      if (m) desktop = m[1].replace(/^\$HOME/, home);
+    } catch (_) { /* остаёмся на ~/Desktop */ }
+  }
+  return {
+    home,
+    config,
+    data,
+    desktop,
+    applications: path.join(data, 'applications'),
+    icons: path.join(data, 'icons', 'hicolor'),
+    cache: process.env.XDG_CACHE_HOME || path.join(home, '.cache'),
+  };
+}
+
+/**
+ * Иконка приложения: PNG уже получен из APK (nativeImage.toPNG или декодер WebP).
+ * Раскладываем в hicolor/<size>x<size>/apps/<id>.png, чтобы DE нашёл нужный размер.
+ */
+function installIcon(pngBuffer, iconId, sizes = ICON_SIZES) {
+  if (!Buffer.isBuffer(pngBuffer) || !pngBuffer.length) return null;
   const { nativeImage } = require('electron');
   const base = nativeImage.createFromBuffer(pngBuffer);
   if (!base || base.isEmpty()) return null;
-
-  const images = [];
-  for (const s of ICO_SIZES) {
-    const img = base.getSize().width >= s
-      ? base.resize({ width: s, height: s, quality: 'best' })
-      : base.resize({ width: s, height: s, quality: 'best' }); // 小图放大也比缺尺寸好
-    const dib = buildDib(img.toBitmap(), s);
-    images.push({ size: s, data: dib });
+  const dirs = xdgDirs();
+  const target = path.join(dirs.icons, `${Math.min(256, Math.max(...sizes))}x${Math.min(256, Math.max(...sizes))}`, 'apps');
+  fs.mkdirSync(target, { recursive: true });
+  const file = path.join(target, `${iconId}.png`);
+  const width = base.getSize().width || 0;
+  const big = sizes.filter((s) => s <= Math.max(width, 256));
+  for (const s of big.length ? big : [256]) {
+    const sub = path.join(dirs.icons, `${s}x${s}`, 'apps');
+    fs.mkdirSync(sub, { recursive: true });
+    const img = width >= s ? base.resize({ width: s, height: s, quality: 'best' }) : base.resize({ width: s, height: s });
+    fs.writeFileSync(path.join(sub, `${iconId}.png`), img.toPNG());
   }
-
-  const dir = Buffer.alloc(6 + images.length * 16);
-  dir.writeUInt16LE(0, 0);
-  dir.writeUInt16LE(1, 2);
-  dir.writeUInt16LE(images.length, 4);
-
-  let offset = dir.length;
-  images.forEach((img, i) => {
-    const p = 6 + i * 16;
-    dir.writeUInt8(img.size >= 256 ? 0 : img.size, p);
-    dir.writeUInt8(img.size >= 256 ? 0 : img.size, p + 1);
-    dir.writeUInt8(0, p + 2);
-    dir.writeUInt8(0, p + 3);
-    dir.writeUInt16LE(1, p + 4);
-    dir.writeUInt16LE(32, p + 6);
-    dir.writeUInt32LE(img.data.length, p + 8);
-    dir.writeUInt32LE(offset, p + 12);
-    offset += img.data.length;
-  });
-
-  return Buffer.concat([dir, ...images.map((i) => i.data)]);
-}
-
-function safeFileName(name) {
-  return String(name).replace(/[\\/:*?"<>|]/g, '_').replace(/\s+/g, ' ').trim().slice(0, 60) || 'Android App';
-}
-
-/**
- * PNG-in-ICO：Vista 起 ICO 条目允许直接内嵌 PNG，不用重编码、不丢 alpha。
- * APK 图标常是 WebP/大尺寸 PNG，老的 DIB 路线在这里会整包失败。
- */
-function pngBytesToIco(png) {
-  if (!Buffer.isBuffer(png) || png.length < 24 || png.toString('ascii', 1, 4) !== 'PNG') return null;
-  const w = png.readUInt32BE(16);
-  const h = png.readUInt32BE(20);
-  if (!w || !h || w > 1024 || h > 1024) return null;
-  const dir = Buffer.alloc(22);
-  dir.writeUInt16LE(0, 0);
-  dir.writeUInt16LE(1, 2);
-  dir.writeUInt16LE(1, 4);
-  dir.writeUInt8(w >= 256 ? 0 : w, 6);
-  dir.writeUInt8(h >= 256 ? 0 : h, 7);
-  dir.writeUInt8(0, 8);
-  dir.writeUInt8(0, 9);
-  dir.writeUInt16LE(1, 10);
-  dir.writeUInt16LE(32, 12);
-  dir.writeUInt32LE(png.length, 14);
-  dir.writeUInt32LE(22, 18);
-  return Buffer.concat([dir, png]);
-}
-
-/**
- * 任意 APK 图标 → ICO。三级兜底，保证快捷方式永远带图标：
- *  1) Electron 能直接解（真 PNG/JPEG）→ 多尺寸 DIB ICO；
- *  2) decode 回调（渲染进程用 Chromium 解 WebP）→ PNG-in-ICO；
- *  3) 品牌占位图标 → PNG-in-ICO。
- */
-async function iconToIco(raw, { decode, onFallback } = {}) {
-  const fail = (why) => { try { if (onFallback) onFallback(why); } catch (_) { /* ignore */ } };
-  if (!Buffer.isBuffer(raw) || !raw.length) { fail('empty'); return null; }
-  try {
-    const { nativeImage } = require('electron');
-    const img = nativeImage.createFromBuffer(raw);
-    if (img && !img.isEmpty()) {
-      const ico = pngToIco(img.toPNG());
-      if (ico) return ico;
-    }
-  } catch (_) { /* 非 PNG/JPEG，走下一级 */ }
-
-  if (typeof decode === 'function') {
-    try {
-      const png = await decode(raw);
-      const ico = pngBytesToIco(png);
-      if (ico) return ico;
-      fail('decode-output-invalid');
-    } catch (_) { fail('webp-decode-failed'); }
-  } else {
-    fail('no-decoder');
-  }
-  try {
-    const { drawAppIcon } = require('./png');
-    const ico = pngBytesToIco(drawAppIcon(256));
-    if (ico) { fail('placeholder'); return ico; }
-  } catch (_) { /* ignore */ }
-  return null;
-}
-
-/**
- * 生成桌面快捷方式
- *
- * writeShortcutLink 返回 true 并不代表文件真的落盘了：安全软件拦截、
- * 桌面目录被重定向到未登录的网盘时都可能「成功但没文件」。所以写完必须
- * 回读一次，保证调用方拿到的路径是真实存在的入口。
- *
- * @param {object} opt { shortcutPath, target, args, iconIcoPath, description, cwd }
- */
-function writeShortcut(opt) {
-  const { shell } = require('electron');
-  const dir = path.dirname(opt.shortcutPath);
-  try {
-    if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
-  } catch (e) {
-    throw new Error(`快捷方式目录不可写：${dir}（${e.message}）`);
-  }
-  if (fs.existsSync(opt.shortcutPath)) {
-    try { fs.unlinkSync(opt.shortcutPath); } catch (_) { /* ignore */ }
-  }
-  const ok = shell.writeShortcutLink(opt.shortcutPath, 'create', {
-    target: opt.target,
-    args: opt.args || '',
-    icon: opt.iconIcoPath || opt.target,
-    iconIndex: 0,
-    description: opt.description || '',
-    cwd: opt.cwd || path.dirname(opt.target),
-    appUserModelId: opt.appUserModelId,
-  });
-  if (!ok) throw new Error('创建快捷方式失败（writeShortcutLink 返回 false）');
-  if (!fs.existsSync(opt.shortcutPath)) {
-    throw new Error(`快捷方式未落盘：${opt.shortcutPath}`);
-  }
-  return opt.shortcutPath;
+  // копия рядом с .desktop помогает тем DE, которые ищут иконки рядом
+  fs.writeFileSync(file, base.toPNG());
+  return file;
 }
 
 function removeShortcut(p) {
@@ -182,6 +160,14 @@ function removeShortcut(p) {
 }
 
 module.exports = {
-  pngToIco, pngBytesToIco, iconToIco,
-  writeShortcut, removeShortcut, safeFileName, ICO_SIZES,
+  ICON_SIZES,
+  safeFileName,
+  execQuote,
+  desktopEscape,
+  desktopEntry,
+  writeDesktopFile,
+  updateDesktopDatabase,
+  installIcon,
+  removeShortcut,
+  xdgDirs,
 };

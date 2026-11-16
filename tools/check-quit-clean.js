@@ -1,12 +1,12 @@
 'use strict';
 /**
- * 端到端验证「打开软件只看到软件界面」：
- *   1) 用沙盒 APPDATA 起一个真实 ApkStart（--smoke 会在 6.5 秒后自己正常退出）；
- *   2) 沙盒里放一条假应用记录，触发「打开即预热」——模拟器会在后台冷启动；
- *   3) 全程用窗口代理盯可见窗口：模拟器主窗 / qemu 控制台 / netsim 控制台都不许出现；
- *   4) 应用退出后再盯 8 秒：确认不会在桌面上「遗留」一个 Android Emulator 黑窗。
+ * End-to-end check that opening the app shows only the app window:
+ *   1) start a real ApkStart with a sandboxed XDG dirs (--smoke exits after 6.5 s);
+ *   2) plant a fake app record to trigger prewarm — the emulator cold-boots in the background;
+ *   3) watch visible windows throughout: no emulator, qemu or netsim windows may appear;
+ *   4) keep watching for 8 s after exit: nothing may be left behind.
  *
- * 用法: node tools/check-quit-clean.js
+ * Usage: node tools/check-quit-clean.js
  */
 const fs = require('fs');
 const path = require('path');
@@ -14,8 +14,8 @@ const { spawn } = require('child_process');
 const { WinAgent } = require('../src/core/agent');
 
 const ROOT = path.join(__dirname, '..');
-// 运行时与安卓数据目录都可能被用户改到别的盘，测试时用环境变量指过去，
-// 免得每次都重新下载 1.4GB 运行时、或另建一个空 AVD。
+// The runtime and Android data dirs may live elsewhere; point at them with env vars
+// so the check does not re-download 1.4 GB or create an empty AVD each time.
 const ENGINE = path.resolve(process.env.APKSTART_RUNTIME || path.join(ROOT, 'engine'));
 const AVD_DIR = process.env.APKSTART_AVD_HOME || '';
 const ELECTRON = path.join(ROOT, 'node_modules', 'electron', 'dist', 'electron.exe');
@@ -46,8 +46,8 @@ const bad = (w) => {
   await agent.scope([ENGINE]);
   console.log('agent ready, port=', agent.port);
 
-  // 这个环境里全局设了 ELECTRON_RUN_AS_NODE=1（Electron 会退化成纯 Node），
-  // 必须整个删掉；置空字符串仍然算「已设置」，会起不来。
+  // ELECTRON_RUN_AS_NODE=1 turns Electron into plain Node here and must be removed
+  // entirely; an empty string still counts as set and the app will not start.
   const env = { ...process.env, APPDATA: sandbox };
   delete env.ELECTRON_RUN_AS_NODE;
 
@@ -68,26 +68,26 @@ const bad = (w) => {
     const hit = ((r && r.list) || []).filter(bad);
     if (hit.length) {
       leaked += hit.length;
-      console.log(`[${((i + 1) * 0.5).toFixed(1)}s] 可见的异常窗口:`, JSON.stringify(hit));
+      console.log(`[${((i + 1) * 0.5).toFixed(1)}s] unexpected visible window:`, JSON.stringify(hit));
     }
     if (!exitedAt && proc.exitCode !== null) {
       exitedAt = i;
-      console.log(`[${((i + 1) * 0.5).toFixed(1)}s] ApkStart 已退出，继续观察 8 秒…`);
+      console.log(`[${((i + 1) * 0.5).toFixed(1)}s] ApkStart exited, watching for 8 more seconds...`);
     }
     if (exitedAt && i - exitedAt >= 16) break;
   }
 
   const after = ((await agent.call({ cmd: 'windows' }, 5000).catch(() => null)) || {}).list || [];
   const left = after.filter(bad);
-  console.log('退出后仍在桌面上的异常窗口:', JSON.stringify(left));
+  console.log('unexpected windows still on screen after exit:', JSON.stringify(left));
   console.log('');
   const ok = leaked === 0 && left.length === 0;
-  console.log(`结果：${ok ? '通过（全程零可见窗口）' : '失败'}`);
-  if (out) console.log('--- app 输出 ---\n' + out.trim().split('\n').slice(-6).join('\n'));
+  console.log(`result: ${ok ? 'pass (no visible window at any point)' : 'fail'}`);
+  if (out) console.log('--- app output ---\n' + out.trim().split('\n').slice(-6).join('\n'));
 
   try { proc.kill(); } catch (_) { /* ignore */ }
   agent.dispose();
-  // 沙盒里的 AVD 有好几个 GB，测完顺手清掉（模拟器还占着文件时会失败，忽略即可）
+  // The sandboxed AVD is several GB; clean it up (ignore failures while the emulator holds files)
   try { fs.rmSync(sandbox, { recursive: true, force: true, maxRetries: 3 }); } catch (_) { /* ignore */ }
   process.exit(ok ? 0 : 1);
 })().catch((e) => { console.error('FATAL', e); process.exit(1); });
